@@ -15,6 +15,8 @@
 
 // 信号追溯工具
 #include "SignalTracing.h"
+// 分析结果（统一分类和生成）
+#include "ClkAnalysisResult.h"
 
 // 生成 pass 声明/定义
 #define GEN_PASS_DECL_DFFDEMO
@@ -184,6 +186,31 @@ private:
                                  llvm::DenseSet<Block*> &waitBlocks,
                                  ComplexSubType &complexSub) {
     complexSub = ComplexSubType::NONE;
+
+    // ========== 统一方案: 先检查表达式是否可以生成 ==========
+    auto action = clk_analysis::tryGenerateAction(drv);
+    if (clk_analysis::isComplexAction(action)) {
+      // 表达式无法生成 → CLK_COMPLEX
+      llvm::outs() << "(cannot generate: ";
+      // 分析依赖信号
+      auto deps = signal_tracing::getAllSignalDependencies(value);
+      bool hasClock = false, hasProtocol = false;
+      for (auto &dep : deps) {
+        auto sigType = signal_tracing::classifySignalByName(dep.name);
+        if (sigType == signal_tracing::SignalType::Clock) hasClock = true;
+        if (sigType == signal_tracing::SignalType::Protocol) hasProtocol = true;
+      }
+      if (hasClock) {
+        complexSub = ComplexSubType::CLOCK_RELATED;
+      } else if (hasProtocol) {
+        complexSub = ComplexSubType::PROTOCOL;
+      } else {
+        complexSub = ComplexSubType::DATA_ONLY;
+      }
+      llvm::outs() << "complex) ";
+      return DrvClassification::CLK_COMPLEX;
+    }
+
     // Step 1: 检查 value 是否依赖于 signal 自己
     bool dependsOnSelf = checkDependsOnSignal(value, signal);
 

@@ -17,16 +17,16 @@ using namespace circt;
 
 namespace clk_analysis {
 
-namespace {
-
-/// 获取信号名称
-StringRef getSignalName(Value signal) {
+/// 获取信号名称（从匿名命名空间移出以供外部使用）
+static StringRef getSignalName(Value signal) {
   if (auto sigOp = signal.getDefiningOp<llhd::SignalOp>()) {
     if (auto name = sigOp.getName())
       return *name;
   }
   return "unnamed";
 }
+
+namespace {
 
 /// 获取信号位宽
 int getSignalBitWidth(Value signal) {
@@ -123,8 +123,10 @@ bool isLoopIterator(llhd::DrvOp drv, llvm::DenseSet<Block*> &waitBlocks) {
   return false;  // 保守处理
 }
 
-/// 分析 drv 操作，提取动作（前向声明，在分类阶段使用）
-/// 返回: {能否生成代码, 动作}
+} // anonymous namespace
+
+/// 分析 drv 操作，提取动作
+/// 如果表达式无法生成，返回 COMPUTE 类型且 expression 为 "/* complex expression */"
 EventAction tryGenerateAction(llhd::DrvOp drv) {
   EventAction action;
   action.targetSignal = getSignalName(drv.getSignal()).str();
@@ -222,8 +224,6 @@ bool isComplexAction(const EventAction &action) {
          action.expression == "/* complex expression */";
 }
 
-} // anonymous namespace
-
 ModuleAnalysisResult analyzeModule(mlir::ModuleOp mod) {
   ModuleAnalysisResult result;
 
@@ -279,7 +279,8 @@ ModuleAnalysisResult analyzeModule(mlir::ModuleOp mod) {
           sigResult.hasComplexExpression = true;
           // 更新或插入
           if (it != signalMap.end()) {
-            // 已有记录，如果新的是 COMPLEX，保留原分类但标记有复杂表达式
+            // 已有记录，发现复杂表达式，必须更新分类为 COMPLEX
+            it->second.classification = DrvClassification::CLK_COMPLEX;
             it->second.hasComplexExpression = true;
             it->second.preGeneratedActions.push_back(action);
           } else {

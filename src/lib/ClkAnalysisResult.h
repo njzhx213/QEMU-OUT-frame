@@ -3,6 +3,7 @@
 
 #include "llvm/ADT/StringRef.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "circt/Dialect/LLHD/IR/LLHDOps.h"
 #include <string>
 #include <vector>
 #include <map>
@@ -160,6 +161,17 @@ ModuleAnalysisResult analyzeModule(mlir::ModuleOp mod);
 /// 分析 LLHD 模块，包括事件处理逻辑
 /// 返回完整的分析结果，包含事件处理器
 ModuleAnalysisResult analyzeModuleWithEvents(mlir::ModuleOp mod);
+
+//===----------------------------------------------------------------------===//
+// 表达式生成检查（用于统一分类和代码生成）
+//===----------------------------------------------------------------------===//
+
+/// 尝试为一个 drv 操作生成动作
+/// 如果表达式无法生成，返回 COMPUTE 类型且 expression 为 "/* complex expression */"
+EventAction tryGenerateAction(circt::llhd::DrvOp drv);
+
+/// 检查动作是否是复杂表达式（无法生成代码）
+bool isComplexAction(const EventAction &action);
 
 } // namespace clk_analysis
 
