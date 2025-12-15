@@ -1,5 +1,6 @@
 #include "ClkAnalysisResult.h"
 #include "SignalTracing.h"
+#include "CombTranslator.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "llvm/ADT/DenseSet.h"
@@ -212,16 +213,24 @@ EventAction tryGenerateAction(llhd::DrvOp drv) {
     }
   }
 
-  // 复杂表达式 - 无法生成
+  // 使用 CombTranslator 尝试翻译复杂表达式
+  auto translateResult = comb_translator::translateValue(value);
+  if (translateResult.success) {
+    action.type = ActionType::COMPUTE;
+    action.expression = action.targetSignal + " = " + translateResult.expr;
+    return action;
+  }
+
+  // 真正无法生成的复杂表达式
   action.type = ActionType::COMPUTE;
-  action.expression = "/* complex expression */";
+  action.expression = "/* complex expression: " + translateResult.errorMsg + " */";
   return action;
 }
 
 /// 检查动作是否是复杂表达式（无法生成代码）
 bool isComplexAction(const EventAction &action) {
   return action.type == ActionType::COMPUTE &&
-         action.expression == "/* complex expression */";
+         action.expression.find("/* complex expression") != std::string::npos;
 }
 
 ModuleAnalysisResult analyzeModule(mlir::ModuleOp mod) {
