@@ -171,6 +171,162 @@ inline const char* signalTypeToString(SignalType type) {
   }
 }
 
+//===----------------------------------------------------------------------===//
+// 控制流追踪
+//===----------------------------------------------------------------------===//
+
+/// 驱动动作：记录一个 llhd.drv 操作的信息
+struct DriveAction {
+  llvm::StringRef signalName;     // 被驱动的信号名
+  mlir::Value signal;             // 被驱动的信号
+  mlir::Value value;              // 驱动的值
+  bool isConstant;                // 值是否为常量
+  llvm::APInt constantValue;      // 如果是常量，具体值
+
+  bool isValid() const { return !signalName.empty(); }
+};
+
+/// 条件控制信号：记录触发条件中的控制信号
+struct ControlSignal {
+  llvm::StringRef name;           // 信号名
+  bool requiredValue;             // 触发需要的值 (true=1, false=0)
+};
+
+/// 条件分支信息
+struct BranchCondition {
+  llvm::SmallVector<ControlSignal, 4> controls;  // 控制信号列表
+  bool hasPwrite;                 // 是否包含 pwrite
+  bool pwriteValue;               // pwrite 需要的值
+};
+
+/// 从 AND 操作分析控制条件
+inline BranchCondition analyzeAndCondition(circt::comb::AndOp andOp) {
+  BranchCondition result;
+  result.hasPwrite = false;
+  result.pwriteValue = true;
+
+  llvm::SmallDenseMap<llvm::StringRef, bool> seen;
+
+  for (mlir::Value operand : andOp.getOperands()) {
+    TracedSignal traced = traceToSignal(operand);
+    if (!traced.isValid())
+      continue;
+    if (seen.count(traced.name))
+      continue;
+
+    bool requiredVal = !traced.isInverted;
+
+    if (traced.name == "pwrite") {
+      result.hasPwrite = true;
+      result.pwriteValue = requiredVal;
+      seen.insert({traced.name, requiredVal});
+      continue;
+    }
+
+    ControlSignal ctrl;
+    ctrl.name = traced.name;
+    ctrl.requiredValue = requiredVal;
+    result.controls.push_back(ctrl);
+    seen.insert({traced.name, requiredVal});
+  }
+
+  return result;
+}
+
+/// 从 Block 中收集所有 llhd.drv 操作
+inline void collectDriveOps(mlir::Block *block,
+                            llvm::SmallVectorImpl<DriveAction> &actions,
+                            llvm::SmallPtrSetImpl<mlir::Block*> &visited,
+                            unsigned maxDepth = 10) {
+  if (!block || !visited.insert(block).second)
+    return;
+  if (visited.size() > maxDepth)
+    return;
+
+  for (mlir::Operation &op : *block) {
+    if (auto drv = mlir::dyn_cast<circt::llhd::DrvOp>(&op)) {
+      DriveAction action;
+
+      // 获取目标信号名
+      mlir::Value target = drv.getSignal();
+      if (auto sigOp = target.getDefiningOp()) {
+        if (auto nameAttr = sigOp->getAttrOfType<mlir::StringAttr>("name")) {
+          action.signalName = nameAttr.getValue();
+        }
+      }
+      action.signal = target;
+      action.value = drv.getValue();
+
+      // 检查值是否为常量
+      if (auto constOp = drv.getValue().getDefiningOp<circt::hw::ConstantOp>()) {
+        action.isConstant = true;
+        action.constantValue = constOp.getValue();
+      } else {
+        action.isConstant = false;
+      }
+
+      if (action.isValid())
+        actions.push_back(action);
+    }
+
+    // 跟踪无条件分支
+    if (auto br = mlir::dyn_cast<mlir::cf::BranchOp>(op)) {
+      collectDriveOps(br.getDest(), actions, visited, maxDepth);
+    }
+
+    // 跟踪条件分支（两个方向都收集）
+    if (auto condBr = mlir::dyn_cast<mlir::cf::CondBranchOp>(op)) {
+      collectDriveOps(condBr.getTrueDest(), actions, visited, maxDepth);
+      collectDriveOps(condBr.getFalseDest(), actions, visited, maxDepth);
+    }
+  }
+}
+
+/// 从条件分支追踪 true 分支的所有驱动操作
+inline llvm::SmallVector<DriveAction, 8>
+traceTrueBranchDrives(mlir::cf::CondBranchOp condBr, unsigned maxDepth = 10) {
+  llvm::SmallVector<DriveAction, 8> actions;
+  llvm::SmallPtrSet<mlir::Block*, 16> visited;
+  collectDriveOps(condBr.getTrueDest(), actions, visited, maxDepth);
+  return actions;
+}
+
+/// 从条件分支追踪 false 分支的所有驱动操作
+inline llvm::SmallVector<DriveAction, 8>
+traceFalseBranchDrives(mlir::cf::CondBranchOp condBr, unsigned maxDepth = 10) {
+  llvm::SmallVector<DriveAction, 8> actions;
+  llvm::SmallPtrSet<mlir::Block*, 16> visited;
+  collectDriveOps(condBr.getFalseDest(), actions, visited, maxDepth);
+  return actions;
+}
+
+/// 控制流路径信息
+struct ControlFlowPath {
+  BranchCondition condition;                    // 触发条件
+  llvm::SmallVector<DriveAction, 8> actions;    // 该路径上的驱动动作
+  bool isTrueBranch;                            // 是 true 分支还是 false 分支
+};
+
+/// 分析一个 AND 条件控制的完整路径
+inline std::optional<ControlFlowPath>
+analyzeControlPath(circt::comb::AndOp andOp) {
+  // 检查 AND 结果是否用于条件分支
+  if (!andOp.getResult().hasOneUse())
+    return std::nullopt;
+
+  mlir::Operation *user = *andOp.getResult().getUsers().begin();
+  auto condBr = mlir::dyn_cast<mlir::cf::CondBranchOp>(user);
+  if (!condBr)
+    return std::nullopt;
+
+  ControlFlowPath path;
+  path.condition = analyzeAndCondition(andOp);
+  path.actions = traceTrueBranchDrives(condBr);
+  path.isTrueBranch = true;
+
+  return path;
+}
+
 } // namespace signal_tracing
 
 #endif // SIGNAL_TRACING_H
