@@ -33,13 +33,14 @@
 
 ## 已知问题
 
-### 1. BlockArgument 未解析 (arg0, arg1, ...)
+### 1. BlockArgument 未解析 (arg0, arg1, ...) 【高优先级】
 
 LLHD 中的循环迭代变量会被翻译为 `arg0`、`arg1` 等占位符：
 
 ```c
-// 生成的代码
+// 生成的代码 (gpio_top.c:168-171)
 s->unnamed = (((s->int_level) >> (arg0)) & 1);
+s->unnamed = (((s->int_level_sync_in) >> (arg0)) & 1);
 ```
 
 **原因**: 这来自 Verilog 的 generate/for 循环结构，例如：
@@ -48,19 +49,74 @@ for (i = 0; i < 32; i = i + 1)
     result[i] = gpio_int_level_sync ? int_level[i] : int_level_sync_in[i];
 ```
 
-**解决方案**: 需要手动替换 `arg0` 为具体值，或展开为位操作
+**解决方案**: 需要实现循环展开，将 `arg0` 替换为 0~31 的具体值
 
-### 2. 部分信号未定义
+### 2. 部分信号未定义 【高优先级】
 
-某些内部临时信号可能未被添加到状态结构体：
-- `gpio_int_clk_en_tmp`
-- `int_level`
+某些内部临时信号在生成的代码中未定义：
 
-**解决方案**: 检查原始 Verilog 并手动添加缺失的信号定义
+```c
+// gpio_top.c:134
+/* undefined signal: gpio_int_clk_en_tmp */
 
-### 3. Generate/For 循环展开
+// gpio_top.c:140
+/* undefined signal: int_level */
 
-目前不支持自动展开硬件循环为软件循环或位操作序列
+// gpio_top.c:168 - int_level 被引用但未在 state 结构体中声明
+s->unnamed = (((s->int_level) >> (arg0)) & 1);
+```
+
+**未定义信号列表**：
+- `gpio_int_clk_en_tmp` - 临时使能信号
+- `int_level` - 中断电平信号
+
+**解决方案**: 改进信号追踪，将中间变量也加入状态结构体
+
+### 3. `--analyze-clk` 与 `--gen-qemu` 结果不一致 【中优先级】
+
+| 指标 | --analyze-clk | --gen-qemu |
+|------|---------------|------------|
+| CLK_ACCUMULATE | 0 | 1 (int_k) |
+
+**原因**: 两个 pass 使用不同的分析逻辑
+- `--analyze-clk` 只分析 drv 操作的模式
+- `--gen-qemu` 内部有额外的计数器检测逻辑
+
+**解决方案**: 统一两个 pass 的分析代码
+
+### 4. 事件处理器覆盖不完整 【低优先级】
+
+27 个输入信号，但只生成了 2 个事件处理器：
+- `on_presetn_write` (复位信号) - 25 branches
+- `on_gpio_int_level_sync_write` - 2 branches
+
+**未处理的输入信号**：
+- `pclk`, `pclk_int`, `pclk_intr` (时钟信号)
+- `paddr`, `pwdata`, `penable`, `psel`, `pwrite` (APB 总线信号)
+- `gpio_ext_porta`, `gpio_in_data` 等
+
+**说明**: 部分输入信号（如时钟、总线信号）可能不需要事件处理器
+
+### 5. `unnamed` 信号 【低优先级】
+
+存在一个名为 `unnamed` 的信号（gpio_top.c:286），说明某些 LLHD 信号没有正确命名
+
+### 6. Generate/For 循环展开 【高优先级】
+
+目前不支持自动展开硬件循环为软件循环或位操作序列。
+
+`int_k` 被标记为 `CLK_LOOP_ITER`，是循环迭代变量：
+```
+[drv] %int_k <- (for-loop iter) CLK_LOOP_ITER
+```
+
+原始 HDL 中的循环（如 `for (k = 0; k < 32; k++)` 处理 32 位信号）需要展开
+
+### 7. 寄存器地址映射是自动生成的 【低优先级】
+
+当前地址映射（0x00, 0x04, 0x08...）是按顺序自动分配的，不是根据实际 APB 寄存器地址
+
+**解决方案**: 从 LLHD 中提取实际的寄存器地址信息
 
 ## 使用方法
 
