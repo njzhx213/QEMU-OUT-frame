@@ -97,12 +97,17 @@ private:
                             const clk_analysis::EventHandler &handler);
 
   /// 生成条件分支代码
+  /// parentCondType: 父级条件类型，用于消除冗余条件
   void generateConditionCode(llvm::raw_ostream &os,
                              const clk_analysis::ConditionalBranch &branch,
-                             int indent);
+                             int indent,
+                             clk_analysis::ConditionType parentCondType = clk_analysis::ConditionType::NONE);
 
   /// 检查信号是否是 ptimer 计数器
   bool isCounterSignal(llvm::StringRef name) const;
+
+  /// 检查信号是否存在于状态结构体中
+  bool signalExists(llvm::StringRef name) const;
 
   /// 检查信号是否是派生信号
   const clk_analysis::DerivedSignal* getDerivedSignal(llvm::StringRef name) const;
@@ -141,6 +146,9 @@ private:
 
   /// 转换为大写
   static std::string toUpperCase(llvm::StringRef s);
+
+  /// 清洗信号名（将 . 替换为 _，确保是有效的 C 标识符）
+  static std::string sanitizeName(llvm::StringRef name);
 
   /// 生成缩进
   static void indent(llvm::raw_ostream &os, int level);

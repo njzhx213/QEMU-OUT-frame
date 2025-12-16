@@ -82,13 +82,14 @@ void QEMUDeviceGenerator::generateHeader(llvm::raw_ostream &os) {
 
   // 生成寄存器字段
   for (const auto &sig : signals_) {
+    std::string safeName = sanitizeName(sig.name);
     if (sig.type == QEMUSignalType::ICOUNT_COUNTER) {
       os << "    /* ptimer-based counter: " << sig.name << " */\n";
-      os << "    ptimer_state *" << sig.name << "_ptimer;\n";
-      os << "    " << getCType(sig.bitWidth) << " " << sig.name << "_limit;  "
+      os << "    ptimer_state *" << safeName << "_ptimer;\n";
+      os << "    " << getCType(sig.bitWidth) << " " << safeName << "_limit;  "
          << "/* 计数上限/reload值 */\n";
     } else {
-      os << "    " << getCType(sig.bitWidth) << " " << sig.name << ";\n";
+      os << "    " << getCType(sig.bitWidth) << " " << safeName << ";\n";
     }
   }
 
@@ -103,7 +104,8 @@ void QEMUDeviceGenerator::generateHeader(llvm::raw_ostream &os) {
       }
     }
     if (!found) {
-      os << "    " << getCType(input.second) << " " << input.first << ";  /* input */\n";
+      std::string safeName = sanitizeName(input.first);
+      os << "    " << getCType(input.second) << " " << safeName << ";  /* input */\n";
     }
   }
 
@@ -169,68 +171,71 @@ void QEMUDeviceGenerator::generatePtimerCallback(llvm::raw_ostream &os) {
 
 void QEMUDeviceGenerator::generatePtimerRead(llvm::raw_ostream &os,
                                               const SignalInfo &sig) {
+  std::string safeName = sanitizeName(sig.name);
   os << "/*\n";
   os << " * 读取 " << sig.name << " 计数器\n";
   os << " * 使用 ptimer 获取当前值\n";
   os << " */\n";
   os << "static " << getCType(sig.bitWidth) << " "
-     << deviceName_ << "_get_" << sig.name
+     << deviceName_ << "_get_" << safeName
      << "(" << deviceName_ << "_state *s)\n";
   os << "{\n";
-  os << "    return ptimer_get_count(s->" << sig.name << "_ptimer);\n";
+  os << "    return ptimer_get_count(s->" << safeName << "_ptimer);\n";
   os << "}\n\n";
 }
 
 void QEMUDeviceGenerator::generatePtimerWrite(llvm::raw_ostream &os,
                                                const SignalInfo &sig) {
+  std::string safeName = sanitizeName(sig.name);
   os << "/*\n";
   os << " * 写入 " << sig.name << " 计数器（加载新值）\n";
   os << " */\n";
-  os << "static void " << deviceName_ << "_set_" << sig.name
+  os << "static void " << deviceName_ << "_set_" << safeName
      << "(" << deviceName_ << "_state *s, " << getCType(sig.bitWidth) << " value)\n";
   os << "{\n";
-  os << "    ptimer_transaction_begin(s->" << sig.name << "_ptimer);\n";
-  os << "    ptimer_set_count(s->" << sig.name << "_ptimer, value);\n";
-  os << "    ptimer_transaction_commit(s->" << sig.name << "_ptimer);\n";
+  os << "    ptimer_transaction_begin(s->" << safeName << "_ptimer);\n";
+  os << "    ptimer_set_count(s->" << safeName << "_ptimer, value);\n";
+  os << "    ptimer_transaction_commit(s->" << safeName << "_ptimer);\n";
   os << "}\n\n";
 
   os << "/*\n";
   os << " * 设置 " << sig.name << " 计数器上限/reload值\n";
   os << " */\n";
-  os << "static void " << deviceName_ << "_set_" << sig.name << "_limit"
+  os << "static void " << deviceName_ << "_set_" << safeName << "_limit"
      << "(" << deviceName_ << "_state *s, " << getCType(sig.bitWidth) << " limit)\n";
   os << "{\n";
-  os << "    s->" << sig.name << "_limit = limit;\n";
-  os << "    ptimer_transaction_begin(s->" << sig.name << "_ptimer);\n";
-  os << "    ptimer_set_limit(s->" << sig.name << "_ptimer, limit, 1);\n";
-  os << "    ptimer_transaction_commit(s->" << sig.name << "_ptimer);\n";
+  os << "    s->" << safeName << "_limit = limit;\n";
+  os << "    ptimer_transaction_begin(s->" << safeName << "_ptimer);\n";
+  os << "    ptimer_set_limit(s->" << safeName << "_ptimer, limit, 1);\n";
+  os << "    ptimer_transaction_commit(s->" << safeName << "_ptimer);\n";
   os << "}\n\n";
 
   os << "/*\n";
   os << " * 启动 " << sig.name << " 计数器\n";
   os << " */\n";
-  os << "static void " << deviceName_ << "_start_" << sig.name
+  os << "static void " << deviceName_ << "_start_" << safeName
      << "(" << deviceName_ << "_state *s)\n";
   os << "{\n";
-  os << "    ptimer_transaction_begin(s->" << sig.name << "_ptimer);\n";
-  os << "    ptimer_run(s->" << sig.name << "_ptimer, 0);  /* 0 = 周期模式 */\n";
-  os << "    ptimer_transaction_commit(s->" << sig.name << "_ptimer);\n";
+  os << "    ptimer_transaction_begin(s->" << safeName << "_ptimer);\n";
+  os << "    ptimer_run(s->" << safeName << "_ptimer, 0);  /* 0 = 周期模式 */\n";
+  os << "    ptimer_transaction_commit(s->" << safeName << "_ptimer);\n";
   os << "}\n\n";
 
   os << "/*\n";
   os << " * 停止 " << sig.name << " 计数器\n";
   os << " */\n";
-  os << "static void " << deviceName_ << "_stop_" << sig.name
+  os << "static void " << deviceName_ << "_stop_" << safeName
      << "(" << deviceName_ << "_state *s)\n";
   os << "{\n";
-  os << "    ptimer_transaction_begin(s->" << sig.name << "_ptimer);\n";
-  os << "    ptimer_stop(s->" << sig.name << "_ptimer);\n";
-  os << "    ptimer_transaction_commit(s->" << sig.name << "_ptimer);\n";
+  os << "    ptimer_transaction_begin(s->" << safeName << "_ptimer);\n";
+  os << "    ptimer_stop(s->" << safeName << "_ptimer);\n";
+  os << "    ptimer_transaction_commit(s->" << safeName << "_ptimer);\n";
   os << "}\n\n";
 }
 
 void QEMUDeviceGenerator::generateDerivedSignalGetters(llvm::raw_ostream &os) {
   for (const auto &derived : derivedSignals_) {
+    std::string safeName = sanitizeName(derived.name);
     os << "/*\n";
     os << " * 获取派生信号 " << derived.name << "\n";
     os << " * 计算: " << derived.sourceSignal;
@@ -253,7 +258,7 @@ void QEMUDeviceGenerator::generateDerivedSignalGetters(llvm::raw_ostream &os) {
     os << "\n */\n";
 
     os << "static " << getCType(derived.bitWidth) << " "
-       << deviceName_ << "_get_" << derived.name
+       << deviceName_ << "_get_" << safeName
        << "(" << deviceName_ << "_state *s)\n";
     os << "{\n";
     os << "    return ";
@@ -291,11 +296,12 @@ void QEMUDeviceGenerator::generateMMIORead(llvm::raw_ostream &os) {
 
   int offset = 0;
   for (const auto &sig : signals_) {
+    std::string safeName = sanitizeName(sig.name);
     os << "    case 0x" << llvm::format_hex_no_prefix(offset, 2) << ":  /* " << sig.name << " */\n";
     if (sig.type == QEMUSignalType::ICOUNT_COUNTER) {
-      os << "        value = " << deviceName_ << "_get_" << sig.name << "(s);\n";
+      os << "        value = " << deviceName_ << "_get_" << safeName << "(s);\n";
     } else {
-      os << "        value = s->" << sig.name << ";\n";
+      os << "        value = s->" << safeName << ";\n";
     }
     os << "        break;\n";
     offset += (sig.bitWidth + 7) / 8;
@@ -319,17 +325,18 @@ void QEMUDeviceGenerator::generateMMIOWrite(llvm::raw_ostream &os) {
 
   int offset = 0;
   for (const auto &sig : signals_) {
+    std::string safeName = sanitizeName(sig.name);
     os << "    case 0x" << llvm::format_hex_no_prefix(offset, 2) << ":  /* " << sig.name << " */\n";
     if (sig.type == QEMUSignalType::ICOUNT_COUNTER) {
-      os << "        " << deviceName_ << "_set_" << sig.name << "(s, value);\n";
+      os << "        " << deviceName_ << "_set_" << safeName << "(s, value);\n";
     } else {
-      os << "        s->" << sig.name << " = value;\n";
+      os << "        s->" << safeName << " = value;\n";
     }
 
     // 检查是否有对应的事件处理器
     for (const auto &handler : eventHandlers_) {
       if (handler.triggerSignal == sig.name) {
-        os << "        " << deviceName_ << "_on_" << sig.name << "_write(s, value);\n";
+        os << "        " << deviceName_ << "_on_" << sanitizeName(sig.name) << "_write(s, value);\n";
         break;
       }
     }
@@ -349,13 +356,14 @@ void QEMUDeviceGenerator::generateMMIOWrite(llvm::raw_ostream &os) {
       }
     }
     if (!found) {
+      std::string safeName = sanitizeName(input.first);
       os << "    case 0x" << llvm::format_hex_no_prefix(offset, 2) << ":  /* " << input.first << " (input) */\n";
       // 存储输入信号值
-      os << "        s->" << input.first << " = value;\n";
+      os << "        s->" << safeName << " = value;\n";
       // 检查是否有对应的事件处理器
       for (const auto &handler : eventHandlers_) {
         if (handler.triggerSignal == input.first) {
-          os << "        " << deviceName_ << "_on_" << input.first << "_write(s, value);\n";
+          os << "        " << deviceName_ << "_on_" << safeName << "_write(s, value);\n";
           break;
         }
       }
@@ -399,17 +407,18 @@ void QEMUDeviceGenerator::generateDeviceInit(llvm::raw_ostream &os) {
   // 为每个计数器创建 ptimer
   for (const auto &sig : signals_) {
     if (sig.type == QEMUSignalType::ICOUNT_COUNTER) {
+      std::string safeName = sanitizeName(sig.name);
       os << "    /*\n";
       os << "     * 创建 ptimer: " << sig.name << "\n";
       os << "     * 使用 QEMU_CLOCK_VIRTUAL - 在 icount 模式下用 instruction counter\n";
       os << "     *                          在普通模式下用 host timer\n";
       os << "     */\n";
-      os << "    s->" << sig.name << "_ptimer = ptimer_init(" << deviceName_ << "_timer_tick, s,\n";
+      os << "    s->" << safeName << "_ptimer = ptimer_init(" << deviceName_ << "_timer_tick, s,\n";
       os << "                                                PTIMER_POLICY_DEFAULT);\n";
-      os << "    ptimer_transaction_begin(s->" << sig.name << "_ptimer);\n";
+      os << "    ptimer_transaction_begin(s->" << safeName << "_ptimer);\n";
       os << "    /* 设置频率 (每秒多少次) - 根据 HDL 时钟频率调整 */\n";
-      os << "    ptimer_set_freq(s->" << sig.name << "_ptimer, 1000000);  /* 1MHz */\n";
-      os << "    ptimer_transaction_commit(s->" << sig.name << "_ptimer);\n\n";
+      os << "    ptimer_set_freq(s->" << safeName << "_ptimer, 1000000);  /* 1MHz */\n";
+      os << "    ptimer_transaction_commit(s->" << safeName << "_ptimer);\n\n";
     }
   }
   os << "}\n\n";
@@ -418,15 +427,16 @@ void QEMUDeviceGenerator::generateDeviceInit(llvm::raw_ostream &os) {
   os << "{\n";
   os << "    " << deviceName_ << "_state *s = " << upperName << "(dev);\n\n";
   for (const auto &sig : signals_) {
+    std::string safeName = sanitizeName(sig.name);
     if (sig.type == QEMUSignalType::ICOUNT_COUNTER) {
       os << "    /* 重置 ptimer: " << sig.name << " */\n";
-      os << "    ptimer_transaction_begin(s->" << sig.name << "_ptimer);\n";
-      os << "    ptimer_stop(s->" << sig.name << "_ptimer);\n";
-      os << "    ptimer_set_count(s->" << sig.name << "_ptimer, 0);\n";
-      os << "    ptimer_transaction_commit(s->" << sig.name << "_ptimer);\n";
-      os << "    s->" << sig.name << "_limit = 0;\n";
+      os << "    ptimer_transaction_begin(s->" << safeName << "_ptimer);\n";
+      os << "    ptimer_stop(s->" << safeName << "_ptimer);\n";
+      os << "    ptimer_set_count(s->" << safeName << "_ptimer, 0);\n";
+      os << "    ptimer_transaction_commit(s->" << safeName << "_ptimer);\n";
+      os << "    s->" << safeName << "_limit = 0;\n";
     } else {
-      os << "    s->" << sig.name << " = 0;\n";
+      os << "    s->" << safeName << " = 0;\n";
     }
   }
   os << "    qemu_irq_lower(s->irq);\n";
@@ -480,6 +490,8 @@ void QEMUDeviceGenerator::generateEventHandler(llvm::raw_ostream &os,
                                                 const clk_analysis::EventHandler &handler) {
   using namespace clk_analysis;
 
+  std::string safeTrigger = sanitizeName(handler.triggerSignal);
+
   os << "/*\n";
   os << " * Handler for " << handler.triggerSignal << " signal changes\n";
 
@@ -499,7 +511,7 @@ void QEMUDeviceGenerator::generateEventHandler(llvm::raw_ostream &os,
   }
   os << " */\n";
 
-  os << "static void " << deviceName_ << "_on_" << handler.triggerSignal
+  os << "static void " << deviceName_ << "_on_" << safeTrigger
      << "_write(" << deviceName_ << "_state *s, uint32_t value)\n";
   os << "{\n";
 
@@ -525,9 +537,9 @@ void QEMUDeviceGenerator::generateEventHandler(llvm::raw_ostream &os,
             generateActionCode(os, action, 2);
           }
         }
-        // 生成嵌套条件
+        // 生成嵌套条件（父条件是 SIGNAL_TRUE）
         for (const auto &nested : branch.nestedBranches) {
-          generateConditionCode(os, nested, 2);
+          generateConditionCode(os, nested, 2, ConditionType::SIGNAL_TRUE);
         }
       }
     }
@@ -551,8 +563,9 @@ void QEMUDeviceGenerator::generateEventHandler(llvm::raw_ostream &os,
             generateActionCode(os, action, 2);
           }
         }
+        // 嵌套条件（父条件是 SIGNAL_FALSE）
         for (const auto &nested : branch.nestedBranches) {
-          generateConditionCode(os, nested, 2);
+          generateConditionCode(os, nested, 2, ConditionType::SIGNAL_FALSE);
         }
       }
     }
@@ -578,6 +591,27 @@ bool QEMUDeviceGenerator::isCounterSignal(llvm::StringRef name) const {
   return false;
 }
 
+/// 检查信号是否存在于状态结构体中（signals_ 或 inputSignals_）
+bool QEMUDeviceGenerator::signalExists(llvm::StringRef name) const {
+  // 检查是否在 signals_ 中
+  for (const auto &sig : signals_) {
+    if (sig.name == name) {
+      return true;
+    }
+  }
+  // 检查是否在 inputSignals_ 中
+  for (const auto &input : inputSignals_) {
+    if (input.first == name) {
+      return true;
+    }
+  }
+  // 检查是否是派生信号
+  if (getDerivedSignal(name)) {
+    return true;
+  }
+  return false;
+}
+
 /// 检查信号是否是派生信号
 const clk_analysis::DerivedSignal* QEMUDeviceGenerator::getDerivedSignal(llvm::StringRef name) const {
   for (const auto &derived : derivedSignals_) {
@@ -590,14 +624,15 @@ const clk_analysis::DerivedSignal* QEMUDeviceGenerator::getDerivedSignal(llvm::S
 
 /// 生成信号读取表达式（对 ptimer 计数器和派生信号使用 get_ 函数）
 std::string QEMUDeviceGenerator::getSignalReadExpr(llvm::StringRef name) const {
+  std::string safeName = sanitizeName(name);
   if (isCounterSignal(name)) {
-    return deviceName_ + "_get_" + name.str() + "(s)";
+    return deviceName_ + "_get_" + safeName + "(s)";
   }
   // 检查是否是派生信号
   if (getDerivedSignal(name)) {
-    return deviceName_ + "_get_" + name.str() + "(s)";
+    return deviceName_ + "_get_" + safeName + "(s)";
   }
-  return "s->" + name.str();
+  return "s->" + safeName;
 }
 
 /// 获取控制信号控制的计数器列表
@@ -616,58 +651,73 @@ std::vector<std::string> QEMUDeviceGenerator::getControlledCounters(
 void QEMUDeviceGenerator::generatePtimerStartStop(llvm::raw_ostream &os,
                                                    llvm::StringRef counterName,
                                                    bool start, int indentLevel) {
+  std::string safeName = sanitizeName(counterName);
   indent(os, indentLevel);
   if (start) {
-    os << deviceName_ << "_start_" << counterName << "(s);  "
+    os << deviceName_ << "_start_" << safeName << "(s);  "
        << "/* 启动 ptimer */\n";
   } else {
-    os << deviceName_ << "_stop_" << counterName << "(s);  "
+    os << deviceName_ << "_stop_" << safeName << "(s);  "
        << "/* 停止 ptimer */\n";
   }
 }
 
 void QEMUDeviceGenerator::generateConditionCode(llvm::raw_ostream &os,
                                                  const clk_analysis::ConditionalBranch &branch,
-                                                 int indentLevel) {
+                                                 int indentLevel,
+                                                 clk_analysis::ConditionType parentCondType) {
   using namespace clk_analysis;
 
-  // 生成条件语句
-  indent(os, indentLevel);
-  switch (branch.condType) {
-    case ConditionType::SIGNAL_TRUE:
-      os << "if (value) {\n";
-      break;
-    case ConditionType::SIGNAL_FALSE:
-      os << "if (!value) {\n";
-      break;
-    case ConditionType::COMPARE_GE:
-      os << "if (" << getSignalReadExpr(branch.condSignal) << " >= "
-         << getSignalReadExpr(branch.compareSignal) << ") {\n";
-      break;
-    case ConditionType::COMPARE_LT:
-      os << "if (" << getSignalReadExpr(branch.condSignal) << " < "
-         << getSignalReadExpr(branch.compareSignal) << ") {\n";
-      break;
-    case ConditionType::COMPARE_EQ:
-      os << "if (" << getSignalReadExpr(branch.condSignal) << " == "
-         << getSignalReadExpr(branch.compareSignal) << ") {\n";
-      break;
-    default:
-      os << "/* unconditional */ {\n";
+  // 检查是否与父条件重复（消除冗余条件）
+  bool isRedundant = (branch.condType == parentCondType &&
+                      (branch.condType == ConditionType::SIGNAL_TRUE ||
+                       branch.condType == ConditionType::SIGNAL_FALSE));
+
+  // 如果不是冗余条件，生成条件语句
+  if (!isRedundant) {
+    indent(os, indentLevel);
+    switch (branch.condType) {
+      case ConditionType::SIGNAL_TRUE:
+        os << "if (value) {\n";
+        break;
+      case ConditionType::SIGNAL_FALSE:
+        os << "if (!value) {\n";
+        break;
+      case ConditionType::COMPARE_GE:
+        os << "if (" << getSignalReadExpr(branch.condSignal) << " >= "
+           << getSignalReadExpr(branch.compareSignal) << ") {\n";
+        break;
+      case ConditionType::COMPARE_LT:
+        os << "if (" << getSignalReadExpr(branch.condSignal) << " < "
+           << getSignalReadExpr(branch.compareSignal) << ") {\n";
+        break;
+      case ConditionType::COMPARE_EQ:
+        os << "if (" << getSignalReadExpr(branch.condSignal) << " == "
+           << getSignalReadExpr(branch.compareSignal) << ") {\n";
+        break;
+      default:
+        os << "/* unconditional */ {\n";
+    }
   }
+
+  // 计算嵌套的缩进级别
+  int nestedIndent = isRedundant ? indentLevel : indentLevel + 1;
 
   // 生成动作
   for (const auto &action : branch.actions) {
-    generateActionCode(os, action, indentLevel + 1);
+    generateActionCode(os, action, nestedIndent);
   }
 
-  // 生成嵌套条件分支
+  // 生成嵌套条件分支（传递当前条件类型以检测冗余）
   for (const auto &nestedBranch : branch.nestedBranches) {
-    generateConditionCode(os, nestedBranch, indentLevel + 1);
+    generateConditionCode(os, nestedBranch, nestedIndent, branch.condType);
   }
 
-  indent(os, indentLevel);
-  os << "}\n";
+  // 如果不是冗余条件，关闭大括号
+  if (!isRedundant) {
+    indent(os, indentLevel);
+    os << "}\n";
+  }
 }
 
 void QEMUDeviceGenerator::generateActionCode(llvm::raw_ostream &os,
@@ -676,6 +726,9 @@ void QEMUDeviceGenerator::generateActionCode(llvm::raw_ostream &os,
   using namespace clk_analysis;
 
   indent(os, indentLevel);
+
+  std::string safeTarget = sanitizeName(action.targetSignal);
+  std::string safeSource = sanitizeName(action.sourceSignal);
 
   // 检查目标是否是 icount 计数器
   bool isCounter = false;
@@ -694,20 +747,25 @@ void QEMUDeviceGenerator::generateActionCode(llvm::raw_ostream &os,
       if (value == -1) value = 1;  // true
 
       if (isCounter) {
-        os << deviceName_ << "_set_" << action.targetSignal
+        os << deviceName_ << "_set_" << safeTarget
            << "(s, " << value << ");\n";
       } else {
-        os << "s->" << action.targetSignal << " = " << value << ";\n";
+        os << "s->" << safeTarget << " = " << value << ";\n";
       }
       break;
     }
 
     case ActionType::ASSIGN_SIGNAL:
+      // 验证源信号是否存在于状态结构体中
+      if (!signalExists(action.sourceSignal)) {
+        os << "/* undefined signal: " << action.sourceSignal << " */\n";
+        break;
+      }
       if (isCounter) {
-        os << deviceName_ << "_set_" << action.targetSignal
-           << "(s, s->" << action.sourceSignal << ");\n";
+        os << deviceName_ << "_set_" << safeTarget
+           << "(s, s->" << safeSource << ");\n";
       } else {
-        os << "s->" << action.targetSignal << " = s->" << action.sourceSignal << ";\n";
+        os << "s->" << safeTarget << " = s->" << safeSource << ";\n";
       }
       break;
 
@@ -715,7 +773,7 @@ void QEMUDeviceGenerator::generateActionCode(llvm::raw_ostream &os,
       if (isCounter) {
         os << "/* counter accumulate handled by ptimer */\n";
       } else {
-        os << "s->" << action.targetSignal << " += " << action.constValue << ";\n";
+        os << "s->" << safeTarget << " += " << action.constValue << ";\n";
       }
       break;
 
@@ -731,14 +789,27 @@ void QEMUDeviceGenerator::generateActionCode(llvm::raw_ostream &os,
         case clk_analysis::CompareType::NE: cmpOp = "!="; break;
         default: break;
       }
-      os << "s->" << action.targetSignal << " = ("
+      os << "s->" << safeTarget << " = ("
          << lhsExpr << " " << cmpOp << " " << rhsExpr << ");\n";
       break;
     }
 
-    case ActionType::COMPUTE:
-      os << action.expression << "\n";
+    case ActionType::COMPUTE: {
+      // 表达式格式: "targetSignal = expr"
+      // 需要添加 s-> 前缀和分号
+      std::string expr = action.expression;
+      size_t eqPos = expr.find(" = ");
+      if (eqPos != std::string::npos) {
+        std::string target = expr.substr(0, eqPos);
+        std::string rhs = expr.substr(eqPos + 3);  // 跳过 " = "
+        std::string safeTarget = sanitizeName(target);
+        os << "s->" << safeTarget << " = " << rhs << ";\n";
+      } else {
+        // 如果没有赋值，可能是纯表达式或注释
+        os << expr << "\n";
+      }
       break;
+    }
   }
 }
 
@@ -753,6 +824,20 @@ std::string QEMUDeviceGenerator::toUpperCase(llvm::StringRef s) {
   std::string result = s.str();
   for (char &c : result) {
     c = std::toupper(static_cast<unsigned char>(c));
+  }
+  return result;
+}
+
+std::string QEMUDeviceGenerator::sanitizeName(llvm::StringRef name) {
+  std::string result = name.str();
+  for (char &c : result) {
+    if (c == '.' || c == '[' || c == ']' || c == '-' || c == ' ') {
+      c = '_';
+    }
+  }
+  // 确保不以数字开头
+  if (!result.empty() && std::isdigit(static_cast<unsigned char>(result[0]))) {
+    result = "_" + result;
   }
   return result;
 }

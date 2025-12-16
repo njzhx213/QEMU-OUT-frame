@@ -442,83 +442,6 @@ bool analyzeCondition(Value cond, ConditionalBranch &branch) {
   return false;
 }
 
-/// 分析 drv 操作，提取动作
-EventAction analyzeDrvAction(llhd::DrvOp drv) {
-  EventAction action;
-  action.targetSignal = getSignalName(drv.getSignal()).str();
-
-  Value value = drv.getValue();
-
-  // 检查是否是常量赋值
-  if (auto constOp = value.getDefiningOp<hw::ConstantOp>()) {
-    action.type = ActionType::ASSIGN_CONST;
-    action.constValue = constOp.getValue().getSExtValue();
-    return action;
-  }
-
-  // 检查是否是简单的信号赋值
-  if (auto prb = value.getDefiningOp<llhd::PrbOp>()) {
-    action.type = ActionType::ASSIGN_SIGNAL;
-    action.sourceSignal = getSignalName(prb.getSignal()).str();
-    return action;
-  }
-
-  // 检查是否是比较操作的结果 (signal = a cmp b)
-  if (auto icmp = value.getDefiningOp<comb::ICmpOp>()) {
-    auto lhsTraced = signal_tracing::traceToSignal(icmp.getLhs());
-    auto rhsTraced = signal_tracing::traceToSignal(icmp.getRhs());
-
-    if (lhsTraced.isValid() && rhsTraced.isValid()) {
-      action.type = ActionType::ASSIGN_COMPARE;
-      action.compareLhs = lhsTraced.name.str();
-      action.compareRhs = rhsTraced.name.str();
-
-      switch (icmp.getPredicate()) {
-        case comb::ICmpPredicate::uge:
-        case comb::ICmpPredicate::sge:
-          action.compareType = CompareType::GE;
-          break;
-        case comb::ICmpPredicate::ult:
-        case comb::ICmpPredicate::slt:
-          action.compareType = CompareType::LT;
-          break;
-        case comb::ICmpPredicate::eq:
-          action.compareType = CompareType::EQ;
-          break;
-        case comb::ICmpPredicate::ne:
-          action.compareType = CompareType::NE;
-          break;
-        default:
-          action.compareType = CompareType::NONE;
-      }
-      return action;
-    }
-  }
-
-  // 检查是否是累加操作
-  if (auto addOp = value.getDefiningOp<comb::AddOp>()) {
-    for (Value operand : addOp.getOperands()) {
-      if (auto prb = operand.getDefiningOp<llhd::PrbOp>()) {
-        if (getSignalName(prb.getSignal()) == action.targetSignal) {
-          // 这是 signal = signal + something
-          for (Value op2 : addOp.getOperands()) {
-            if (auto constOp = op2.getDefiningOp<hw::ConstantOp>()) {
-              action.type = ActionType::ACCUMULATE;
-              action.constValue = constOp.getValue().getSExtValue();
-              return action;
-            }
-          }
-        }
-      }
-    }
-  }
-
-  // 复杂表达式
-  action.type = ActionType::COMPUTE;
-  action.expression = "/* complex expression */";
-  return action;
-}
-
 /// 递归遍历 block，收集 drv 操作和嵌套条件
 /// inputSignals: 输入信号集合，用于判断是否跳过嵌套条件
 void collectDrvsInBlock(Block *block, ConditionalBranch &branch,
@@ -532,7 +455,7 @@ void collectDrvsInBlock(Block *block, ConditionalBranch &branch,
   // 收集这个 block 中的所有 drv
   for (Operation &op : *block) {
     if (auto drv = dyn_cast<llhd::DrvOp>(&op)) {
-      branch.actions.push_back(analyzeDrvAction(drv));
+      branch.actions.push_back(tryGenerateAction(drv));
     }
   }
 
