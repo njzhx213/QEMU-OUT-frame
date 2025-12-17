@@ -12,6 +12,7 @@
 #include "llvm/Support/WithColor.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/Format.h"
 
 // CIRCT 方言
 #include "circt/Dialect/HW/HWDialect.h"
@@ -171,11 +172,21 @@ int main(int argc, char **argv) {
       }
     }
 
-    // 打印输入信号
+    // 打印输入信号（按类型分类）
     if (!analysisResult.inputSignals.empty()) {
-      llvm::outs() << "\nInput Signals (event triggers):\n";
+      llvm::outs() << "\nInput Signals (classified):\n";
       for (const auto &input : analysisResult.inputSignals) {
-        llvm::outs() << "  - " << input.first << "\n";
+        llvm::outs() << "  - " << input.first << " [" << input.second << "]";
+        if (input.second == "clock") {
+          llvm::outs() << " -> filtered (not needed in simulation)";
+        } else if (input.second == "apb") {
+          llvm::outs() << " -> MMIO read/write";
+        } else if (input.second == "gpio_in") {
+          llvm::outs() << " -> qdev_init_gpio_in";
+        } else {
+          llvm::outs() << " -> event trigger";
+        }
+        llvm::outs() << "\n";
       }
     }
 
@@ -185,6 +196,23 @@ int main(int argc, char **argv) {
       for (const auto &handler : analysisResult.eventHandlers) {
         llvm::outs() << "  - on_" << handler.triggerSignal << "_write: "
                      << handler.branches.size() << " branches\n";
+      }
+    }
+
+    // 打印 APB 寄存器映射
+    if (!analysisResult.apbMappings.empty()) {
+      llvm::outs() << "\nAPB Register Mappings:\n";
+      for (const auto &mapping : analysisResult.apbMappings) {
+        llvm::outs() << "  - 0x" << llvm::format_hex_no_prefix(mapping.address, 2)
+                     << ": " << mapping.registerName;
+        if (mapping.isWritable && mapping.isReadable) {
+          llvm::outs() << " (R/W)";
+        } else if (mapping.isWritable) {
+          llvm::outs() << " (W)";
+        } else if (mapping.isReadable) {
+          llvm::outs() << " (R)";
+        }
+        llvm::outs() << "\n";
       }
     }
     llvm::outs() << "\n";
@@ -212,9 +240,22 @@ int main(int argc, char **argv) {
       }
     }
 
-    // 添加输入信号
+    // 设置输入信号类型映射
+    gen.setInputSignalTypes(analysisResult.inputSignals);
+
+    // 添加输入信号（按类型分类）
     for (const auto &input : analysisResult.inputSignals) {
-      gen.addInputSignal(input.first, 32);  // 默认 32 位
+      const std::string &signalName = input.first;
+      const std::string &signalType = input.second;
+
+      if (signalType == "gpio_in") {
+        // GPIO 外部输入：使用 qdev_init_gpio_in 处理
+        gen.addGPIOInputSignal(signalName, 32);
+      } else if (signalType == "input") {
+        // 普通输入信号：添加为输入信号（用于事件处理）
+        gen.addInputSignal(signalName, 32);
+      }
+      // clock 和 apb 类型信号在此不添加，它们有专门的处理方式
     }
 
     // 添加事件处理器
@@ -231,6 +272,9 @@ int main(int argc, char **argv) {
     for (const auto &rel : analysisResult.controlRelations) {
       gen.addControlRelation(rel);
     }
+
+    // 设置 APB 寄存器映射
+    gen.setAPBMappings(analysisResult.apbMappings);
 
     // 生成代码
     if (!qemuOutputDir.empty()) {

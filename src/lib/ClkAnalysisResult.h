@@ -144,6 +144,17 @@ struct ControlRelation {
   ControlRelation() : activeHigh(true) {}
 };
 
+/// APB 寄存器映射（从 paddr 提取）
+struct APBRegisterMapping {
+  uint32_t address;            // 字节地址（paddr << 2）
+  std::string registerName;    // 寄存器名
+  int bitWidth;                // 位宽
+  bool isWritable;             // 是否可写（有 APB write 条件）
+  bool isReadable;             // 是否可读（有 APB read 条件）
+
+  APBRegisterMapping() : address(0), bitWidth(32), isWritable(false), isReadable(true) {}
+};
+
 /// 模块分析结果
 struct ModuleAnalysisResult {
   std::string moduleName;
@@ -152,6 +163,7 @@ struct ModuleAnalysisResult {
   std::map<std::string, std::string> inputSignals;  // 输入信号: name -> type
   std::vector<DerivedSignal> derivedSignals;  // 派生信号列表
   std::vector<ControlRelation> controlRelations;  // 控制信号关系
+  std::vector<APBRegisterMapping> apbMappings;  // APB 寄存器地址映射
 };
 
 /// 分析 LLHD 模块，返回信号分类结果

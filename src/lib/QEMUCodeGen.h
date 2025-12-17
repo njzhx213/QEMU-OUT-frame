@@ -66,6 +66,15 @@ public:
   /// 添加控制关系（输入信号控制计数器启停）
   void addControlRelation(const clk_analysis::ControlRelation &relation);
 
+  /// 添加 GPIO 输入信号（用于 qdev_init_gpio_in）
+  void addGPIOInputSignal(llvm::StringRef name, int bitWidth);
+
+  /// 设置输入信号分类信息
+  void setInputSignalTypes(const std::map<std::string, std::string> &types);
+
+  /// 设置 APB 寄存器映射
+  void setAPBMappings(const std::vector<clk_analysis::APBRegisterMapping> &mappings);
+
   /// 生成 QEMU 设备头文件
   void generateHeader(llvm::raw_ostream &os);
 
@@ -79,6 +88,9 @@ private:
   std::vector<std::pair<std::string, int>> inputSignals_;
   std::vector<clk_analysis::DerivedSignal> derivedSignals_;
   std::vector<clk_analysis::ControlRelation> controlRelations_;
+  std::vector<std::pair<std::string, int>> gpioInputSignals_;  // GPIO 外部输入
+  std::map<std::string, std::string> inputSignalTypes_;  // 输入信号分类
+  std::vector<clk_analysis::APBRegisterMapping> apbMappings_;  // APB 寄存器映射
 
   /// 生成 ptimer 回调函数
   void generatePtimerCallback(llvm::raw_ostream &os);
@@ -137,6 +149,12 @@ private:
 
   /// 生成 MMIO 写函数
   void generateMMIOWrite(llvm::raw_ostream &os);
+
+  /// 生成 GPIO 输入回调函数
+  void generateGPIOInputCallback(llvm::raw_ostream &os);
+
+  /// 生成 update_state 函数（重新计算组合逻辑）
+  void generateUpdateState(llvm::raw_ostream &os);
 
   /// 生成设备初始化代码
   void generateDeviceInit(llvm::raw_ostream &os);

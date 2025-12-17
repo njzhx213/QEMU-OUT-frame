@@ -43,6 +43,113 @@ struct TranslateResult {
 // 辅助函数
 //===----------------------------------------------------------------------===//
 
+/// 从 SSA 值获取名称（用于没有 name 属性的信号）
+/// 使用简单的打印方法获取 SSA 名称
+inline std::string getSSANameFromValue(mlir::Value val) {
+  // 对于 OpResult，获取定义操作的结果名
+  if (auto opResult = mlir::dyn_cast<mlir::OpResult>(val)) {
+    mlir::Operation *defOp = opResult.getOwner();
+    // 尝试获取 sym_name 或其他命名属性
+    if (auto nameAttr = defOp->getAttrOfType<mlir::StringAttr>("name")) {
+      return nameAttr.getValue().str();
+    }
+    if (auto symName = defOp->getAttrOfType<mlir::StringAttr>("sym_name")) {
+      return symName.getValue().str();
+    }
+    // 使用操作的位置信息构造名称
+    // 打印完整的 Value 到字符串，然后提取名称部分
+    std::string str;
+    llvm::raw_string_ostream os(str);
+    val.print(os);
+    os.flush();
+    // 格式通常是 "%name" 或 "<block argument>"
+    if (!str.empty() && str[0] == '%') {
+      // 提取 %name 部分（到空格或冒号为止）
+      size_t end = str.find_first_of(" :");
+      if (end != std::string::npos) {
+        return str.substr(1, end - 1);
+      }
+      return str.substr(1);
+    }
+  }
+  return "";
+}
+
+/// 检测位提取模式的结果
+struct BitExtractPattern {
+  bool isPattern;           // 是否匹配位提取模式
+  std::string signalName;   // 被提取的信号名
+  bool usesBlockArgument;   // 索引是否是 BlockArgument
+
+  static BitExtractPattern none() {
+    return {false, "", false};
+  }
+  static BitExtractPattern match(const std::string &sig, bool usesArg) {
+    return {true, sig, usesArg};
+  }
+};
+
+/// 检测 (signal >> index) & 1 模式
+/// 如果索引是 BlockArgument，则标记 usesBlockArgument = true
+inline BitExtractPattern detectBitExtractPattern(mlir::Value val) {
+  // 模式1: comb.extract (signal >> blockArg) from 0 : (i32) -> i1
+  if (auto extractOp = val.getDefiningOp<circt::comb::ExtractOp>()) {
+    if (extractOp.getLowBit() == 0 &&
+        extractOp.getType().getIntOrFloatBitWidth() == 1) {
+      mlir::Value input = extractOp.getInput();
+
+      // 检查是否是 shru 操作
+      if (auto shruOp = input.getDefiningOp<circt::comb::ShrUOp>()) {
+        mlir::Value signal = shruOp.getLhs();
+        mlir::Value index = shruOp.getRhs();
+
+        // 检查信号是否来自 llhd.prb
+        if (auto prbOp = signal.getDefiningOp<circt::llhd::PrbOp>()) {
+          mlir::Value sig = prbOp.getSignal();
+          std::string sigName;
+          if (auto sigOp = sig.getDefiningOp()) {
+            if (auto nameAttr = sigOp->getAttrOfType<mlir::StringAttr>("name")) {
+              sigName = nameAttr.getValue().str();
+            } else {
+              // 使用 SSA 名称作为后备
+              sigName = getSSANameFromValue(sig);
+            }
+          }
+
+          // 检查索引是否是 BlockArgument
+          bool usesBlockArg = mlir::isa<mlir::BlockArgument>(index);
+
+          // 也可能索引是通过 prb 读取的循环迭代器信号
+          if (!usesBlockArg) {
+            if (auto idxPrb = index.getDefiningOp<circt::llhd::PrbOp>()) {
+              mlir::Value idxSig = idxPrb.getSignal();
+              if (auto idxSigOp = idxSig.getDefiningOp()) {
+                std::string idxName;
+                if (auto nameAttr = idxSigOp->getAttrOfType<mlir::StringAttr>("name")) {
+                  idxName = nameAttr.getValue().str();
+                } else {
+                  idxName = getSSANameFromValue(idxSig);
+                }
+                // 如果是 int_k 这样的循环迭代器
+                if (idxName.find("int_k") != std::string::npos ||
+                    idxName.find("_k") != std::string::npos ||
+                    idxName.find("_i") != std::string::npos) {
+                  usesBlockArg = true;  // 视为循环迭代器
+                }
+              }
+            }
+          }
+
+          if (!sigName.empty()) {
+            return BitExtractPattern::match(sigName, usesBlockArg);
+          }
+        }
+      }
+    }
+  }
+  return BitExtractPattern::none();
+}
+
 /// 获取信号名称（穿透 llhd.prb）
 inline std::string getSignalName(mlir::Value val) {
   // 直接是 llhd.prb
@@ -51,6 +158,11 @@ inline std::string getSignalName(mlir::Value val) {
     if (auto sigOp = sig.getDefiningOp()) {
       if (auto nameAttr = sigOp->getAttrOfType<mlir::StringAttr>("name")) {
         return "s->" + nameAttr.getValue().str();
+      }
+      // 使用 SSA 名称作为后备
+      std::string ssaName = getSSANameFromValue(sig);
+      if (!ssaName.empty()) {
+        return "s->" + ssaName;
       }
     }
     return "s->unnamed";
@@ -328,6 +440,20 @@ inline TranslateResult translateValue(mlir::Value val, unsigned maxDepth = 10) {
   // mux %cond, %true, %false : iN
   // C: cond ? trueVal : falseVal
   if (auto muxOp = mlir::dyn_cast<circt::comb::MuxOp>(defOp)) {
+    // 优化：检测 mux(cond, a[i], b[i]) 模式，简化为 cond ? a : b
+    auto truePattern = detectBitExtractPattern(muxOp.getTrueValue());
+    auto falsePattern = detectBitExtractPattern(muxOp.getFalseValue());
+
+    if (truePattern.isPattern && falsePattern.isPattern &&
+        truePattern.usesBlockArgument && falsePattern.usesBlockArgument) {
+      // 两边都是用 BlockArgument 索引的位提取，简化为整数级别操作
+      auto cond = translateValue(muxOp.getCond(), maxDepth - 1);
+      if (!cond.success) return cond;
+      return TranslateResult::ok("((" + cond.expr + ") ? (s->" +
+                                  truePattern.signalName + ") : (s->" +
+                                  falsePattern.signalName + "))");
+    }
+
     auto cond = translateValue(muxOp.getCond(), maxDepth - 1);
     auto trueVal = translateValue(muxOp.getTrueValue(), maxDepth - 1);
     auto falseVal = translateValue(muxOp.getFalseValue(), maxDepth - 1);

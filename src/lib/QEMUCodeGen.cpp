@@ -50,6 +50,18 @@ void QEMUDeviceGenerator::addControlRelation(const clk_analysis::ControlRelation
   controlRelations_.push_back(relation);
 }
 
+void QEMUDeviceGenerator::addGPIOInputSignal(llvm::StringRef name, int bitWidth) {
+  gpioInputSignals_.emplace_back(name.str(), bitWidth);
+}
+
+void QEMUDeviceGenerator::setInputSignalTypes(const std::map<std::string, std::string> &types) {
+  inputSignalTypes_ = types;
+}
+
+void QEMUDeviceGenerator::setAPBMappings(const std::vector<clk_analysis::APBRegisterMapping> &mappings) {
+  apbMappings_ = mappings;
+}
+
 void QEMUDeviceGenerator::generateHeader(llvm::raw_ostream &os) {
   std::string upperName = toUpperCase(deviceName_);
 
@@ -109,6 +121,28 @@ void QEMUDeviceGenerator::generateHeader(llvm::raw_ostream &os) {
     }
   }
 
+  // 生成 GPIO 外部输入信号字段
+  for (const auto &gpio : gpioInputSignals_) {
+    // 跳过已经在 signals_ 或 inputSignals_ 中的
+    bool found = false;
+    for (const auto &sig : signals_) {
+      if (sig.name == gpio.first) {
+        found = true;
+        break;
+      }
+    }
+    for (const auto &input : inputSignals_) {
+      if (input.first == gpio.first) {
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      std::string safeName = sanitizeName(gpio.first);
+      os << "    " << getCType(gpio.second) << " " << safeName << ";  /* gpio input */\n";
+    }
+  }
+
   os << "} " << deviceName_ << "_state;\n\n";
   os << "#endif /* HW_" << upperName << "_H */\n";
 }
@@ -144,6 +178,14 @@ void QEMUDeviceGenerator::generateSource(llvm::raw_ostream &os) {
 
   // 生成派生信号的 getter 函数
   generateDerivedSignalGetters(os);
+
+  // 生成 update_state 函数（需要在 GPIO 回调之前定义）
+  if (!gpioInputSignals_.empty()) {
+    generateUpdateState(os);
+  }
+
+  // 生成 GPIO 输入回调函数
+  generateGPIOInputCallback(os);
 
   // 生成事件处理函数
   generateEventHandlers(os);
@@ -294,18 +336,43 @@ void QEMUDeviceGenerator::generateMMIORead(llvm::raw_ostream &os) {
   os << "    uint64_t value = 0;\n\n";
   os << "    switch (addr) {\n";
 
-  int offset = 0;
-  for (const auto &sig : signals_) {
-    std::string safeName = sanitizeName(sig.name);
-    os << "    case 0x" << llvm::format_hex_no_prefix(offset, 2) << ":  /* " << sig.name << " */\n";
-    if (sig.type == QEMUSignalType::ICOUNT_COUNTER) {
-      os << "        value = " << deviceName_ << "_get_" << safeName << "(s);\n";
-    } else {
-      os << "        value = s->" << safeName << ";\n";
+  // 如果有 APB 映射，使用真实地址
+  if (!apbMappings_.empty()) {
+    for (const auto &mapping : apbMappings_) {
+      if (!mapping.isReadable)
+        continue;
+      std::string safeName = sanitizeName(mapping.registerName);
+      os << "    case 0x" << llvm::format_hex_no_prefix(mapping.address, 2)
+         << ":  /* " << mapping.registerName << " */\n";
+      // 检查是否是计数器
+      bool isCounter = false;
+      for (const auto &sig : signals_) {
+        if (sig.name == mapping.registerName && sig.type == QEMUSignalType::ICOUNT_COUNTER) {
+          os << "        value = " << deviceName_ << "_get_" << safeName << "(s);\n";
+          isCounter = true;
+          break;
+        }
+      }
+      if (!isCounter) {
+        os << "        value = s->" << safeName << ";\n";
+      }
+      os << "        break;\n";
     }
-    os << "        break;\n";
-    offset += (sig.bitWidth + 7) / 8;
-    if (offset % 4 != 0) offset = (offset + 3) & ~3;
+  } else {
+    // 后备：使用顺序地址
+    int offset = 0;
+    for (const auto &sig : signals_) {
+      std::string safeName = sanitizeName(sig.name);
+      os << "    case 0x" << llvm::format_hex_no_prefix(offset, 2) << ":  /* " << sig.name << " */\n";
+      if (sig.type == QEMUSignalType::ICOUNT_COUNTER) {
+        os << "        value = " << deviceName_ << "_get_" << safeName << "(s);\n";
+      } else {
+        os << "        value = s->" << safeName << ";\n";
+      }
+      os << "        break;\n";
+      offset += (sig.bitWidth + 7) / 8;
+      if (offset % 4 != 0) offset = (offset + 3) & ~3;
+    }
   }
 
   os << "    default:\n";
@@ -323,52 +390,84 @@ void QEMUDeviceGenerator::generateMMIOWrite(llvm::raw_ostream &os) {
   os << "    " << deviceName_ << "_state *s = opaque;\n\n";
   os << "    switch (addr) {\n";
 
-  int offset = 0;
-  for (const auto &sig : signals_) {
-    std::string safeName = sanitizeName(sig.name);
-    os << "    case 0x" << llvm::format_hex_no_prefix(offset, 2) << ":  /* " << sig.name << " */\n";
-    if (sig.type == QEMUSignalType::ICOUNT_COUNTER) {
-      os << "        " << deviceName_ << "_set_" << safeName << "(s, value);\n";
-    } else {
-      os << "        s->" << safeName << " = value;\n";
-    }
-
-    // 检查是否有对应的事件处理器
-    for (const auto &handler : eventHandlers_) {
-      if (handler.triggerSignal == sig.name) {
-        os << "        " << deviceName_ << "_on_" << sanitizeName(sig.name) << "_write(s, value);\n";
-        break;
+  // 如果有 APB 映射，使用真实地址
+  if (!apbMappings_.empty()) {
+    for (const auto &mapping : apbMappings_) {
+      if (!mapping.isWritable)
+        continue;
+      std::string safeName = sanitizeName(mapping.registerName);
+      os << "    case 0x" << llvm::format_hex_no_prefix(mapping.address, 2)
+         << ":  /* " << mapping.registerName << " */\n";
+      // 检查是否是计数器
+      bool isCounter = false;
+      for (const auto &sig : signals_) {
+        if (sig.name == mapping.registerName && sig.type == QEMUSignalType::ICOUNT_COUNTER) {
+          os << "        " << deviceName_ << "_set_" << safeName << "(s, value);\n";
+          isCounter = true;
+          break;
+        }
       }
-    }
-
-    os << "        break;\n";
-    offset += (sig.bitWidth + 7) / 8;
-    if (offset % 4 != 0) offset = (offset + 3) & ~3;
-  }
-
-  // 为输入信号生成 MMIO 入口（如果它们不在 signals_ 中）
-  for (const auto &input : inputSignals_) {
-    bool found = false;
-    for (const auto &sig : signals_) {
-      if (sig.name == input.first) {
-        found = true;
-        break;
+      if (!isCounter) {
+        os << "        s->" << safeName << " = value;\n";
       }
-    }
-    if (!found) {
-      std::string safeName = sanitizeName(input.first);
-      os << "    case 0x" << llvm::format_hex_no_prefix(offset, 2) << ":  /* " << input.first << " (input) */\n";
-      // 存储输入信号值
-      os << "        s->" << safeName << " = value;\n";
       // 检查是否有对应的事件处理器
       for (const auto &handler : eventHandlers_) {
-        if (handler.triggerSignal == input.first) {
+        if (handler.triggerSignal == mapping.registerName) {
           os << "        " << deviceName_ << "_on_" << safeName << "_write(s, value);\n";
           break;
         }
       }
       os << "        break;\n";
-      offset += 4;
+    }
+  } else {
+    // 后备：使用顺序地址
+    int offset = 0;
+    for (const auto &sig : signals_) {
+      std::string safeName = sanitizeName(sig.name);
+      os << "    case 0x" << llvm::format_hex_no_prefix(offset, 2) << ":  /* " << sig.name << " */\n";
+      if (sig.type == QEMUSignalType::ICOUNT_COUNTER) {
+        os << "        " << deviceName_ << "_set_" << safeName << "(s, value);\n";
+      } else {
+        os << "        s->" << safeName << " = value;\n";
+      }
+
+      // 检查是否有对应的事件处理器
+      for (const auto &handler : eventHandlers_) {
+        if (handler.triggerSignal == sig.name) {
+          os << "        " << deviceName_ << "_on_" << sanitizeName(sig.name) << "_write(s, value);\n";
+          break;
+        }
+      }
+
+      os << "        break;\n";
+      offset += (sig.bitWidth + 7) / 8;
+      if (offset % 4 != 0) offset = (offset + 3) & ~3;
+    }
+
+    // 为输入信号生成 MMIO 入口（如果它们不在 signals_ 中）
+    for (const auto &input : inputSignals_) {
+      bool found = false;
+      for (const auto &sig : signals_) {
+        if (sig.name == input.first) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        std::string safeName = sanitizeName(input.first);
+        os << "    case 0x" << llvm::format_hex_no_prefix(offset, 2) << ":  /* " << input.first << " (input) */\n";
+        // 存储输入信号值
+        os << "        s->" << safeName << " = value;\n";
+        // 检查是否有对应的事件处理器
+        for (const auto &handler : eventHandlers_) {
+          if (handler.triggerSignal == input.first) {
+            os << "        " << deviceName_ << "_on_" << safeName << "_write(s, value);\n";
+            break;
+          }
+        }
+        os << "        break;\n";
+        offset += 4;
+      }
     }
   }
 
@@ -397,6 +496,20 @@ void QEMUDeviceGenerator::generateDeviceInit(llvm::raw_ostream &os) {
   os << "                          TYPE_" << upperName << ", 0x1000);\n";
   os << "    sysbus_init_mmio(sbd, &s->iomem);\n";
   os << "    sysbus_init_irq(sbd, &s->irq);\n";
+
+  // 初始化 GPIO 输入
+  if (!gpioInputSignals_.empty()) {
+    // 找出最大的 GPIO 线数（通常是位宽）
+    int maxLines = 32;  // 默认 32 线
+    for (const auto &gpio : gpioInputSignals_) {
+      if (gpio.second > maxLines) {
+        maxLines = gpio.second;
+      }
+    }
+    os << "\n    /* Initialize GPIO inputs */\n";
+    os << "    qdev_init_gpio_in(DEVICE(s), " << deviceName_ << "_gpio_input_set, "
+       << maxLines << ");\n";
+  }
   os << "}\n\n";
 
   // realize 函数 - 初始化 ptimer
@@ -811,6 +924,53 @@ void QEMUDeviceGenerator::generateActionCode(llvm::raw_ostream &os,
       break;
     }
   }
+}
+
+void QEMUDeviceGenerator::generateGPIOInputCallback(llvm::raw_ostream &os) {
+  if (gpioInputSignals_.empty())
+    return;
+
+  std::string upperName = toUpperCase(deviceName_);
+
+  os << "/*\n";
+  os << " * GPIO Input Callback - called when external GPIO state changes\n";
+  os << " */\n";
+  os << "static void " << deviceName_ << "_gpio_input_set(void *opaque, int line, int value)\n";
+  os << "{\n";
+  os << "    " << deviceName_ << "_state *s = " << upperName << "(opaque);\n\n";
+
+  // 为每个 GPIO 输入信号生成更新代码
+  for (const auto &gpio : gpioInputSignals_) {
+    std::string safeName = sanitizeName(gpio.first);
+    os << "    /* Update " << gpio.first << " */\n";
+    os << "    s->" << safeName << " = deposit32(s->" << safeName << ", line, 1, value != 0);\n";
+  }
+
+  os << "\n    /* Recalculate combinational logic */\n";
+  os << "    " << deviceName_ << "_update_state(s);\n";
+  os << "}\n\n";
+}
+
+void QEMUDeviceGenerator::generateUpdateState(llvm::raw_ostream &os) {
+  std::string upperName = toUpperCase(deviceName_);
+
+  os << "/*\n";
+  os << " * Update State - recalculate combinational logic after input changes\n";
+  os << " * TODO: Generate from Signal Tracing results\n";
+  os << " */\n";
+  os << "static void " << deviceName_ << "_update_state(" << deviceName_ << "_state *s)\n";
+  os << "{\n";
+  os << "    /* Combinational logic: gpio_ext_porta -> int_level -> gpio_int_status */\n";
+  os << "    /* TODO: Add traced combinational expressions here */\n";
+  os << "\n";
+  os << "    /* Update interrupt output */\n";
+  os << "    uint32_t pending = s->gpio_int_status & s->gpio_int_en & ~s->gpio_int_mask;\n";
+  os << "    if (pending) {\n";
+  os << "        qemu_irq_raise(s->irq);\n";
+  os << "    } else {\n";
+  os << "        qemu_irq_lower(s->irq);\n";
+  os << "    }\n";
+  os << "}\n\n";
 }
 
 const char* QEMUDeviceGenerator::getCType(int bitWidth) {

@@ -11,20 +11,137 @@
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/LLHD/IR/LLHDOps.h"
+#include "circt/Dialect/Seq/SeqOps.h"
 #include <functional>
+#include <algorithm>
 
 using namespace mlir;
 using namespace circt;
 
 namespace clk_analysis {
 
-/// 获取信号名称（从匿名命名空间移出以供外部使用）
-static StringRef getSignalName(Value signal) {
+/// 检测是否是循环中的位提取目标
+/// 返回原始信号名和是否是循环位提取
+struct BitDrvTarget {
+  std::string signalName;  // 使用 std::string 避免生命周期问题
+  bool isBitExtract;       // 是否是 sig.extract
+  bool usesLoopIterator;   // 索引是否使用循环迭代器
+
+  static BitDrvTarget simple(const std::string &name) {
+    return {name, false, false};
+  }
+  static BitDrvTarget bitExtract(const std::string &name, bool usesLoop) {
+    return {name, true, usesLoop};
+  }
+};
+
+/// 检查索引值是否可能是循环迭代器
+static bool isLikelyLoopIterator(Value idx) {
+  // BlockArgument
+  if (isa<BlockArgument>(idx))
+    return true;
+
+  // 通过 mux 选择的索引（常见于 LLHD 循环中）
+  if (auto muxOp = idx.getDefiningOp<comb::MuxOp>()) {
+    // 检查 true 分支是否包含 BlockArgument 或循环变量
+    Value trueVal = muxOp.getTrueValue();
+    if (auto extract = trueVal.getDefiningOp<comb::ExtractOp>()) {
+      if (isa<BlockArgument>(extract.getInput()))
+        return true;
+      // 检查是否是从循环迭代器信号提取
+      if (auto prb = extract.getInput().getDefiningOp<llhd::PrbOp>()) {
+        if (auto sigOp = prb.getSignal().getDefiningOp<llhd::SignalOp>()) {
+          if (auto name = sigOp.getName()) {
+            std::string n = name->str();
+            if (n.find("int_k") != std::string::npos ||
+                n.find("_k") != std::string::npos)
+              return true;
+          }
+        }
+      }
+    }
+    // 直接是 BlockArgument 的提取
+    if (isa<BlockArgument>(trueVal))
+      return true;
+  }
+
+  return false;
+}
+
+/// 从 SSA 值获取名称（用于没有 name 属性的信号）
+static std::string getSSAName(Value val) {
+  // 对于 OpResult，获取定义操作的结果名
+  if (auto opResult = dyn_cast<OpResult>(val)) {
+    Operation *defOp = opResult.getOwner();
+    // 尝试获取 name 或 sym_name 属性
+    if (auto nameAttr = defOp->getAttrOfType<StringAttr>("name")) {
+      return nameAttr.getValue().str();
+    }
+    if (auto symName = defOp->getAttrOfType<StringAttr>("sym_name")) {
+      return symName.getValue().str();
+    }
+    // 打印 Value 并提取 SSA 名称
+    std::string str;
+    llvm::raw_string_ostream os(str);
+    val.print(os);
+    os.flush();
+    // 格式通常是 "%name" 或 "<block argument>"
+    if (!str.empty() && str[0] == '%') {
+      size_t end = str.find_first_of(" :");
+      if (end != std::string::npos) {
+        return str.substr(1, end - 1);
+      }
+      return str.substr(1);
+    }
+  }
+  return "";
+}
+
+/// 获取信号名称和位提取信息
+static BitDrvTarget getSignalInfo(Value signal) {
+  // 处理 llhd.sig.extract
+  if (auto sigExtract = signal.getDefiningOp<llhd::SigExtractOp>()) {
+    Value baseSig = sigExtract.getInput();
+    Value idx = sigExtract.getLowBit();
+    bool usesLoop = isLikelyLoopIterator(idx);
+
+    if (auto sigOp = baseSig.getDefiningOp<llhd::SignalOp>()) {
+      if (auto name = sigOp.getName()) {
+        return BitDrvTarget::bitExtract(name->str(), usesLoop);
+      }
+      // 使用 SSA 名称作为后备
+      std::string ssaName = getSSAName(baseSig);
+      if (!ssaName.empty()) {
+        return BitDrvTarget::bitExtract(ssaName, usesLoop);
+      }
+    }
+    return BitDrvTarget::bitExtract("unnamed", usesLoop);
+  }
+
+  // 普通信号
   if (auto sigOp = signal.getDefiningOp<llhd::SignalOp>()) {
     if (auto name = sigOp.getName())
-      return *name;
+      return BitDrvTarget::simple(name->str());
+    // 使用 SSA 名称作为后备
+    std::string ssaName = getSSAName(signal);
+    if (!ssaName.empty()) {
+      return BitDrvTarget::simple(ssaName);
+    }
   }
-  return "unnamed";
+  return BitDrvTarget::simple("unnamed");
+}
+
+/// 获取信号名称（从匿名命名空间移出以供外部使用）
+static std::string getSignalNameStr(Value signal) {
+  return getSignalInfo(signal).signalName;
+}
+
+/// 兼容旧接口
+static StringRef getSignalName(Value signal) {
+  // 注意：返回临时对象的 StringRef 可能有问题，但短期内使用是安全的
+  static thread_local std::string lastSignalName;
+  lastSignalName = getSignalInfo(signal).signalName;
+  return lastSignalName;
 }
 
 namespace {
@@ -105,23 +222,68 @@ int getSubtractStep(comb::SubOp subOp, Value signal) {
   return 0;
 }
 
+/// 检查 drv 是否和循环条件在同一个 wait-free 循环中
+bool isInSameLoopWithCondition(llhd::DrvOp drv, Block *loopHead,
+                                llvm::DenseSet<Block*> &waitBlocks) {
+  // 检查 loopHead 中是否有对同一 signal 的比较
+  for (Operation &op : *loopHead) {
+    if (auto icmp = dyn_cast<comb::ICmpOp>(&op)) {
+      for (Value operand : icmp.getOperands()) {
+        if (auto prbCmp = operand.getDefiningOp<llhd::PrbOp>()) {
+          if (prbCmp.getSignal() == drv.getSignal()) {
+            // 检查 loopHead 的出口：一个继续循环，一个退出到 wait
+            Operation *headTerminator = loopHead->getTerminator();
+            if (auto condBr = dyn_cast<cf::CondBranchOp>(headTerminator)) {
+              bool oneExitToWait =
+                  waitBlocks.contains(condBr.getTrueDest()) ||
+                  waitBlocks.contains(condBr.getFalseDest());
+              bool oneExitToLoop =
+                  !waitBlocks.contains(condBr.getTrueDest()) ||
+                  !waitBlocks.contains(condBr.getFalseDest());
+              if (oneExitToWait && oneExitToLoop) {
+                // 这是 for 循环模式：条件判断后一边继续循环，一边退出
+                return true;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return false;
+}
+
 /// 检查是否是 for 循环迭代器
+/// 关键：循环是否在 wait 之间完成（不跨越 wait）
+///
+/// For 循环特征：
+/// 1. drv 所在 block 不直接跳转到 wait block
+/// 2. 从 drv block 到 wait block 的路径上存在循环回边
+/// 3. 循环条件检查和递增在同一个 wait-free 区域
 bool isLoopIterator(llhd::DrvOp drv, llvm::DenseSet<Block*> &waitBlocks) {
   Block *currentBlock = drv->getBlock();
   Operation *terminator = currentBlock->getTerminator();
 
   if (auto br = dyn_cast<cf::BranchOp>(terminator)) {
     if (waitBlocks.contains(br.getDest())) {
-      return false;  // 直接跳转到 wait block，是跨 clock cycle 的
+      // 直接跳转到 wait block，说明是跨 clock cycle 的累积
+      return false;
+    }
+    // 检查目标 block 是否是循环头（会跳回 wait 或继续循环）
+    Block *dest = br.getDest();
+    // 检查从这个 block 能否不经过 wait 就到达对同一 signal 的 icmp
+    if (isInSameLoopWithCondition(drv, dest, waitBlocks)) {
+      return true;
     }
   } else if (auto condBr = dyn_cast<cf::CondBranchOp>(terminator)) {
+    // 对于条件分支，如果任一目标是 wait block，则认为是跨 clock cycle
     if (waitBlocks.contains(condBr.getTrueDest()) ||
         waitBlocks.contains(condBr.getFalseDest())) {
       return false;
     }
   }
 
-  return false;  // 保守处理
+  return false;
 }
 
 } // anonymous namespace
@@ -130,9 +292,53 @@ bool isLoopIterator(llhd::DrvOp drv, llvm::DenseSet<Block*> &waitBlocks) {
 /// 如果表达式无法生成，返回 COMPUTE 类型且 expression 为 "/* complex expression */"
 EventAction tryGenerateAction(llhd::DrvOp drv) {
   EventAction action;
-  action.targetSignal = getSignalName(drv.getSignal()).str();
+
+  // 获取目标信号信息
+  BitDrvTarget targetInfo = getSignalInfo(drv.getSignal());
+  action.targetSignal = targetInfo.signalName;
 
   Value value = drv.getValue();
+
+  // 检测循环中的位级别赋值模式
+  // 如果 drv 目标是 sig.extract 且使用循环迭代器，尝试简化为整数级别操作
+  if (targetInfo.isBitExtract && targetInfo.usesLoopIterator) {
+    // 检测值是否也是位提取模式 (signal >> idx) & 1
+    auto bitPattern = comb_translator::detectBitExtractPattern(value);
+    if (bitPattern.isPattern && bitPattern.usesBlockArgument) {
+      // 两边都是位提取，简化为整数级别赋值
+      // target[i] = source[i] -> target = source
+      action.type = ActionType::ASSIGN_SIGNAL;
+      action.sourceSignal = bitPattern.signalName;
+      return action;
+    }
+
+    // 检测是否是常量赋值到位 (target[i] = 0 或 target[i] = 1)
+    if (auto constOp = value.getDefiningOp<hw::ConstantOp>()) {
+      // 对于 target[i] = 0，整个信号应该是 target = 0 或用位操作
+      // 为简化，我们跳过这种循环中的操作，因为它们通常在循环外有另一个赋值
+      action.type = ActionType::COMPUTE;
+      action.expression = "/* loop bit assign: " + action.targetSignal +
+                          "[i] = " + std::to_string(constOp.getValue().getSExtValue()) +
+                          " - handled at loop level */";
+      return action;
+    }
+
+    // 对于更复杂的模式，尝试使用 CombTranslator
+    auto translateResult = comb_translator::translateValue(value);
+    if (translateResult.success) {
+      // 检查翻译结果是否是整数级别的表达式（没有 arg0）
+      if (translateResult.expr.find("arg") == std::string::npos) {
+        action.type = ActionType::COMPUTE;
+        action.expression = action.targetSignal + " = " + translateResult.expr;
+        return action;
+      }
+    }
+
+    // 无法简化的循环位操作，标记为跳过
+    action.type = ActionType::COMPUTE;
+    action.expression = "/* loop bit operation on " + action.targetSignal + " - skip */";
+    return action;
+  }
 
   // 检查是否是常量赋值
   if (auto constOp = value.getDefiningOp<hw::ConstantOp>()) {
@@ -364,6 +570,49 @@ ModuleAnalysisResult analyzeModule(mlir::ModuleOp mod) {
         }
       });
     });
+
+    // 处理 process 外部的 drv 操作（组合逻辑）
+    // 这些 drv 不在任何 process 内部
+    hwMod.walk([&](llhd::DrvOp drv) {
+      // 检查是否在 process 内部
+      Operation *parent = drv->getParentOp();
+      while (parent && !isa<llhd::ProcessOp>(parent) && !isa<hw::HWModuleOp>(parent)) {
+        parent = parent->getParentOp();
+      }
+      // 如果父操作是 ProcessOp，跳过（已经处理过）
+      if (isa<llhd::ProcessOp>(parent)) {
+        return;
+      }
+
+      // 处理 process 外部的 drv
+      Value signal = drv.getSignal();
+      std::string sigName = getSignalNameStr(signal);
+
+      // 如果已经记录过这个信号，跳过
+      if (signalMap.count(sigName)) {
+        return;
+      }
+
+      SignalAnalysisResult sigResult;
+      sigResult.name = sigName;
+      sigResult.bitWidth = getSignalBitWidth(signal);
+      sigResult.direction = AccumulateDirection::NONE;
+      sigResult.stepValue = 0;
+      sigResult.hasComplexExpression = false;
+
+      EventAction action = tryGenerateAction(drv);
+      sigResult.preGeneratedActions.push_back(action);
+
+      if (isComplexAction(action)) {
+        sigResult.classification = DrvClassification::CLK_COMPLEX;
+        sigResult.hasComplexExpression = true;
+      } else {
+        // 组合逻辑通常是 IGNORABLE
+        sigResult.classification = DrvClassification::CLK_IGNORABLE;
+      }
+
+      signalMap[sigName] = sigResult;
+    });
   });
 
   // 转换为 vector
@@ -380,16 +629,87 @@ ModuleAnalysisResult analyzeModule(mlir::ModuleOp mod) {
 
 namespace {
 
+/// 检查信号名是否是时钟信号
+bool isClockSignal(const std::string &name) {
+  // 精确匹配
+  if (name == "clk" || name == "clock")
+    return true;
+  // 前缀匹配
+  if (name.find("pclk") == 0 || name.find("dbclk") == 0 ||
+      name.find("hclk") == 0 || name.find("aclk") == 0 ||
+      name.find("sclk") == 0 || name.find("fclk") == 0)
+    return true;
+  // 后缀匹配
+  if (name.size() > 4 && name.substr(name.size() - 4) == "_clk")
+    return true;
+  if (name.size() > 5 && name.substr(name.size() - 5) == "_pclk")
+    return true;
+  return false;
+}
+
+/// 检查信号名是否是 APB 协议信号
+bool isAPBProtocolSignal(const std::string &name) {
+  return name == "psel" || name == "penable" || name == "pwrite" ||
+         name == "paddr" || name == "pwdata" || name == "prdata" ||
+         name == "pready" || name == "pslverr";
+}
+
+/// 检查信号名是否是 GPIO 外部输入信号
+/// 只匹配真正的外部端口输入，不匹配 gpio_int_xxx 等控制寄存器
+bool isGPIOInputSignal(const std::string &name) {
+  // gpio_ext_porta, gpio_ext_portb, etc. - 外部端口数据
+  if (name.find("gpio_ext_port") != std::string::npos)
+    return true;
+  // gpio_ext_data - 外部数据
+  if (name == "gpio_ext_data")
+    return true;
+  // gpio_in_data - 外部输入数据（注意：不要匹配 gpio_int_xxx）
+  if (name == "gpio_in_data")
+    return true;
+  // 其他 _porta, _portb 等后缀（但不包含 gpio_int）
+  if (name.find("gpio_int") == std::string::npos) {
+    if (name.find("_porta") != std::string::npos ||
+        name.find("_portb") != std::string::npos ||
+        name.find("_portc") != std::string::npos ||
+        name.find("_portd") != std::string::npos)
+      return true;
+  }
+  return false;
+}
+
 /// 从 hw.module 获取输入端口信息
+/// inputs: 普通输入信号
+/// 返回分类后的输入信号，值表示类型:
+///   "input" - 普通输入（事件处理器）
+///   "clock" - 时钟信号（过滤）
+///   "apb" - APB 协议信号（MMIO 处理）
+///   "gpio_in" - GPIO 外部输入（qdev_init_gpio_in）
 void collectInputPorts(hw::HWModuleOp hwMod,
                        std::map<std::string, std::string> &inputs) {
   auto moduleType = hwMod.getHWModuleType();
   for (auto port : moduleType.getPorts()) {
     if (port.dir == hw::ModulePort::Direction::Input) {
       std::string name = port.name.str();
-      // 跳过时钟和复位
-      if (name == "clk" || name == "rst_n" || name == "reset")
+
+      // 1. 过滤时钟信号
+      if (isClockSignal(name)) {
+        inputs[name] = "clock";  // 标记但不参与事件处理
         continue;
+      }
+
+      // 2. 标记 APB 协议信号
+      if (isAPBProtocolSignal(name)) {
+        inputs[name] = "apb";  // 通过 MMIO 处理
+        continue;
+      }
+
+      // 3. 标记 GPIO 外部输入
+      if (isGPIOInputSignal(name)) {
+        inputs[name] = "gpio_in";  // 通过 qdev_init_gpio_in 处理
+        continue;
+      }
+
+      // 4. 其他普通输入信号
       inputs[name] = "input";
     }
   }
@@ -539,7 +859,14 @@ void extractEventHandlers(llhd::ProcessOp proc,
       return;
 
     // 检查条件信号是否是输入信号
-    if (inputSignals.find(trueBranch.condSignal) == inputSignals.end())
+    auto it = inputSignals.find(trueBranch.condSignal);
+    if (it == inputSignals.end())
+      return;
+
+    // 只为普通输入信号生成事件处理器
+    // 跳过: clock（时钟）, apb（APB协议）, gpio_in（GPIO外部输入）
+    const std::string &signalType = it->second;
+    if (signalType == "clock" || signalType == "apb" || signalType == "gpio_in")
       return;
 
     // 找到或创建对应的事件处理器
@@ -755,6 +1082,10 @@ void detectControlRelations(const std::vector<EventHandler> &handlers,
 
 } // anonymous namespace
 
+// Forward declaration
+void extractAPBRegisterMappings(ModuleOp mod,
+                                 std::vector<APBRegisterMapping> &mappings);
+
 ModuleAnalysisResult analyzeModuleWithEvents(mlir::ModuleOp mod) {
   // 首先进行基本分析
   ModuleAnalysisResult result = analyzeModule(mod);
@@ -793,7 +1124,223 @@ ModuleAnalysisResult analyzeModuleWithEvents(mlir::ModuleOp mod) {
   detectControlRelations(result.eventHandlers, result.signals,
                          result.controlRelations, result.inputSignals);
 
+  // 提取 APB 寄存器地址映射
+  extractAPBRegisterMappings(mod, result.apbMappings);
+
   return result;
+}
+
+//===----------------------------------------------------------------------===//
+// APB 寄存器地址映射提取
+//===----------------------------------------------------------------------===//
+
+/// 从模块中提取 APB 寄存器地址映射
+/// 分析模式: paddr → extract → icmp eq const → and(psel, penable, pwrite, icmp) → mux(and, pwdata, reg)
+void extractAPBRegisterMappings(ModuleOp mod,
+                                 std::vector<APBRegisterMapping> &mappings) {
+  // 遍历所有模块
+  mod.walk([&](hw::HWModuleOp hwMod) {
+    // 用于存储: icmp结果Value → (地址值, 地址偏移位数)
+    llvm::DenseMap<Value, std::pair<int64_t, int>> icmpToAddress;
+    // 用于存储: and结果Value → 地址值
+    llvm::DenseMap<Value, int64_t> andToAddress;
+
+    // 第一遍: 找到所有 paddr 相关的 icmp
+    hwMod.walk([&](comb::ICmpOp icmp) {
+      if (icmp.getPredicate() != comb::ICmpPredicate::eq)
+        return;
+
+      // 检查是否比较的是常量
+      Value lhs = icmp.getLhs();
+      Value rhs = icmp.getRhs();
+
+      hw::ConstantOp constOp = nullptr;
+      Value extractVal = nullptr;
+
+      if (auto c = rhs.getDefiningOp<hw::ConstantOp>()) {
+        constOp = c;
+        extractVal = lhs;
+      } else if (auto c = lhs.getDefiningOp<hw::ConstantOp>()) {
+        constOp = c;
+        extractVal = rhs;
+      }
+
+      if (!constOp || !extractVal)
+        return;
+
+      // 检查 extractVal 是否是从 paddr 提取的
+      if (auto extract = extractVal.getDefiningOp<comb::ExtractOp>()) {
+        Value input = extract.getInput();
+        // 检查输入是否是 paddr（可能是 BlockArgument 或命名信号）
+        bool isPaddr = false;
+        if (auto arg = dyn_cast<BlockArgument>(input)) {
+          // 检查参数名
+          if (auto hwMod = dyn_cast<hw::HWModuleOp>(arg.getOwner()->getParentOp())) {
+            auto moduleType = hwMod.getHWModuleType();
+            auto ports = moduleType.getPorts();
+            unsigned argNum = arg.getArgNumber();
+            // 输入端口索引
+            unsigned inputIdx = 0;
+            for (auto port : ports) {
+              if (port.dir == hw::ModulePort::Direction::Input) {
+                if (inputIdx == argNum) {
+                  if (port.name.str().find("paddr") != std::string::npos) {
+                    isPaddr = true;
+                  }
+                  break;
+                }
+                inputIdx++;
+              }
+            }
+          }
+        }
+
+        if (isPaddr) {
+          int64_t addrVal = constOp.getValue().getSExtValue();
+          int lowBit = extract.getLowBit();
+          icmpToAddress[icmp.getResult()] = {addrVal, lowBit};
+        }
+      }
+    });
+
+    // 第二遍: 找到 and(psel, penable, pwrite, icmp) 模式
+    hwMod.walk([&](comb::AndOp andOp) {
+      // 检查操作数中是否有 psel, penable, pwrite 和 icmp 结果
+      bool hasPsel = false, hasPenable = false, hasPwrite = false;
+      Value icmpResult;
+
+      for (Value operand : andOp.getOperands()) {
+        // 检查是否是 BlockArgument (输入信号)
+        if (auto arg = dyn_cast<BlockArgument>(operand)) {
+          if (auto hwMod = dyn_cast<hw::HWModuleOp>(arg.getOwner()->getParentOp())) {
+            auto moduleType = hwMod.getHWModuleType();
+            auto ports = moduleType.getPorts();
+            unsigned argNum = arg.getArgNumber();
+            unsigned inputIdx = 0;
+            for (auto port : ports) {
+              if (port.dir == hw::ModulePort::Direction::Input) {
+                if (inputIdx == argNum) {
+                  std::string name = port.name.str();
+                  if (name == "psel") hasPsel = true;
+                  else if (name == "penable") hasPenable = true;
+                  else if (name == "pwrite") hasPwrite = true;
+                  break;
+                }
+                inputIdx++;
+              }
+            }
+          }
+        }
+        // 检查是否是 icmp 结果
+        if (icmpToAddress.count(operand)) {
+          icmpResult = operand;
+        }
+      }
+
+      // 如果是 APB 写条件模式
+      if (hasPsel && hasPenable && hasPwrite && icmpResult) {
+        andToAddress[andOp.getResult()] = icmpToAddress[icmpResult].first;
+      }
+    });
+
+    // 第三遍: 找到 mux(and, pwdata, reg) 模式
+    hwMod.walk([&](comb::MuxOp mux) {
+      Value cond = mux.getCond();
+      if (!andToAddress.count(cond))
+        return;
+
+      int64_t addrVal = andToAddress[cond];
+      Value trueVal = mux.getTrueValue();
+      Value falseVal = mux.getFalseValue();
+
+      // trueVal 应该是 pwdata, falseVal 应该是寄存器当前值
+      // 检查 trueVal 是否是 pwdata
+      bool isPwdata = false;
+      if (auto arg = dyn_cast<BlockArgument>(trueVal)) {
+        if (auto hwMod = dyn_cast<hw::HWModuleOp>(arg.getOwner()->getParentOp())) {
+          auto moduleType = hwMod.getHWModuleType();
+          auto ports = moduleType.getPorts();
+          unsigned argNum = arg.getArgNumber();
+          unsigned inputIdx = 0;
+          for (auto port : ports) {
+            if (port.dir == hw::ModulePort::Direction::Input) {
+              if (inputIdx == argNum) {
+                if (port.name.str().find("pwdata") != std::string::npos) {
+                  isPwdata = true;
+                }
+                break;
+              }
+              inputIdx++;
+            }
+          }
+        }
+      }
+
+      if (!isPwdata)
+        return;
+
+      // falseVal 应该是寄存器名
+      std::string regName;
+      // 尝试从 seq.firreg 获取名称
+      for (auto *user : mux.getResult().getUsers()) {
+        if (auto firreg = dyn_cast<seq::FirRegOp>(user)) {
+          if (auto nameAttr = firreg->getAttrOfType<StringAttr>("name")) {
+            regName = nameAttr.getValue().str();
+          } else {
+            // 使用 SSA 名称
+            std::string str;
+            llvm::raw_string_ostream os(str);
+            firreg.getResult().print(os);
+            os.flush();
+            if (!str.empty() && str[0] == '%') {
+              size_t end = str.find_first_of(" :");
+              if (end != std::string::npos) {
+                regName = str.substr(1, end - 1);
+              } else {
+                regName = str.substr(1);
+              }
+            }
+          }
+          break;
+        }
+      }
+
+      if (regName.empty())
+        return;
+
+      // 计算字节地址 (假设从 bit 2 提取)
+      uint32_t byteAddr = static_cast<uint32_t>(addrVal) << 2;
+
+      // 检查是否已存在
+      bool found = false;
+      for (auto &mapping : mappings) {
+        if (mapping.address == byteAddr) {
+          found = true;
+          if (mapping.registerName.empty()) {
+            mapping.registerName = regName;
+          }
+          mapping.isWritable = true;
+          break;
+        }
+      }
+
+      if (!found) {
+        APBRegisterMapping mapping;
+        mapping.address = byteAddr;
+        mapping.registerName = regName;
+        mapping.bitWidth = mux.getType().getIntOrFloatBitWidth();
+        mapping.isWritable = true;
+        mapping.isReadable = true;
+        mappings.push_back(mapping);
+      }
+    });
+  });
+
+  // 按地址排序
+  std::sort(mappings.begin(), mappings.end(),
+            [](const APBRegisterMapping &a, const APBRegisterMapping &b) {
+              return a.address < b.address;
+            });
 }
 
 } // namespace clk_analysis
