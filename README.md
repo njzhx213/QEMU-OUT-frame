@@ -11,6 +11,20 @@
    - 在 `ClkAnalysisResult.cpp` 中添加 `isInSameLoopWithCondition()` 函数
    - 现在两个 pass 对 `int_k` 的分类一致（CLK_LOOP_ITER，不再错误识别为 CLK_ACCUMULATE）
 
+2. **BlockArgument (arg0) 循环展开**: 将循环中的 bit-by-bit 操作简化为整数级别操作
+   - 检测 `mux(cond, a[i], b[i])` 模式，简化为 `cond ? a : b`
+   - 检测 `target[i] = source[i]` 模式，简化为 `target = source`
+   - 之前: `s->unnamed = (((s->int_level) >> (arg0)) & 1);`
+   - 之后: `s->gpio_int_status_level = s->int_level;`
+
+3. **处理 process 外部的组合逻辑**: 现在正确识别和处理不在 `llhd.process` 内的 drv 操作
+   - 之前 `int_level` 等信号未被检测到
+   - 现在所有组合逻辑信号都会被正确追踪
+
+4. **SSA 名称后备机制**: 对于没有 `name` 属性的 LLHD 信号，使用 SSA 名称作为后备
+   - 之前: 这些信号显示为 `/* undefined signal: int_level */`
+   - 之后: 正确使用 `s->int_level`
+
 ### 2025-12-16
 
 **新增功能：**
@@ -40,44 +54,23 @@
 
 ## 已知问题
 
-### 1. BlockArgument 未解析 (arg0, arg1, ...) 【高优先级】
+### ~~1. BlockArgument 未解析 (arg0, arg1, ...)~~ 【已修复 2025-12-17】
 
-LLHD 中的循环迭代变量会被翻译为 `arg0`、`arg1` 等占位符：
+已通过检测 bit-by-bit 操作模式并简化为整数级别操作修复。
 
+现在生成的代码：
 ```c
-// 生成的代码 (gpio_top.c:168-171)
-s->unnamed = (((s->int_level) >> (arg0)) & 1);
-s->unnamed = (((s->int_level_sync_in) >> (arg0)) & 1);
+// 简化为整数级别操作
+s->gpio_int_status_level = s->gpio_int_level_sync ? s->int_level : s->int_level_sync_in;
 ```
 
-**原因**: 这来自 Verilog 的 generate/for 循环结构，例如：
-```verilog
-for (i = 0; i < 32; i = i + 1)
-    result[i] = gpio_int_level_sync ? int_level[i] : int_level_sync_in[i];
-```
+### ~~2. 部分信号未定义~~ 【已修复 2025-12-17】
 
-**解决方案**: 需要实现循环展开，将 `arg0` 替换为 0~31 的具体值
+已通过以下方式修复：
+1. 添加 SSA 名称后备机制，对于没有 `name` 属性的信号使用 SSA 名称
+2. 处理 process 外部的组合逻辑 drv 操作
 
-### 2. 部分信号未定义 【高优先级】
-
-某些内部临时信号在生成的代码中未定义：
-
-```c
-// gpio_top.c:134
-/* undefined signal: gpio_int_clk_en_tmp */
-
-// gpio_top.c:140
-/* undefined signal: int_level */
-
-// gpio_top.c:168 - int_level 被引用但未在 state 结构体中声明
-s->unnamed = (((s->int_level) >> (arg0)) & 1);
-```
-
-**未定义信号列表**：
-- `gpio_int_clk_en_tmp` - 临时使能信号
-- `int_level` - 中断电平信号
-
-**解决方案**: 改进信号追踪，将中间变量也加入状态结构体
+现在 `int_level` 等信号都能正确识别并加入状态结构体。
 
 ### ~~3. `--analyze-clk` 与 `--gen-qemu` 结果不一致~~ 【已修复 2025-12-17】
 
@@ -103,16 +96,16 @@ s->unnamed = (((s->int_level) >> (arg0)) & 1);
 
 存在一个名为 `unnamed` 的信号（gpio_top.c:286），说明某些 LLHD 信号没有正确命名
 
-### 6. Generate/For 循环展开 【高优先级】
+### ~~6. Generate/For 循环展开~~ 【已修复 2025-12-17】
 
-目前不支持自动展开硬件循环为软件循环或位操作序列。
+已通过检测 bit-by-bit 操作模式并简化为整数级别操作修复。
 
-`int_k` 被标记为 `CLK_LOOP_ITER`，是循环迭代变量：
+对于 `mux(cond, a[i], b[i])` 形式的循环操作，现在自动简化为：
+```c
+s->result = s->cond ? s->a : s->b;
 ```
-[drv] %int_k <- (for-loop iter) CLK_LOOP_ITER
-```
 
-原始 HDL 中的循环（如 `for (k = 0; k < 32; k++)` 处理 32 位信号）需要展开
+不再需要显式的循环展开。
 
 ### 7. 寄存器地址映射是自动生成的 【低优先级】
 
