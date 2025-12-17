@@ -153,6 +153,44 @@ static void gpio_top_update_state(gpio_top_state *s)
 
 **相关代码**: [QEMUCodeGen.cpp:841-861](src/lib/QEMUCodeGen.cpp#L841-L861)
 
+### 9. 输入信号数据流分析缺失
+
+当前输入信号分类是**基于名字匹配**，而不是基于实际的数据流分析：
+
+```cpp
+// ClkAnalysisResult.cpp - 纯名字匹配
+bool isClockSignal(const std::string &name) {
+  if (name == "clk" || name == "clock") return true;
+  if (name.find("pclk") == 0) return true;  // 名字前缀匹配
+  ...
+}
+
+bool isGPIOInputSignal(const std::string &name) {
+  if (name.find("gpio_ext_port") != std::string::npos) return true;
+  ...
+}
+```
+
+**问题**:
+1. **无数据流分析** - 不知道输入信号是否真的被使用
+2. **可能误分类** - `pclk_int` 可能不是时钟，但会被名字匹配过滤
+3. **不知道影响范围** - 不知道 `gpio_ext_porta` 会影响哪些内部信号
+
+**需要实现**:
+```
+输入信号 ──► 数据流追踪 ──► 影响的内部信号 ──► 生成对应代码
+    │              │              │
+    │              ▼              ▼
+    │        分析 IR 中的      哪些 drv 依赖
+    │        use-def 链       该输入信号
+    ▼
+gpio_ext_porta → int_level, gpio_int_status, ...
+```
+
+**与 Issue #8 的关系**: Signal Tracing 需要从输入信号开始追踪依赖链，这是实现 `update_state()` 组合逻辑生成的前提。
+
+**相关代码**: [ClkAnalysisResult.cpp:427-510](src/lib/ClkAnalysisResult.cpp#L427-L510)
+
 ## 输入信号处理架构
 
 ### 核心思路
