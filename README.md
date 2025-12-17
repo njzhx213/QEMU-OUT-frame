@@ -117,22 +117,16 @@ s->result = s->cond ? s->a : s->b;
 
 不再需要显式的循环展开。
 
-### ~~7. 寄存器地址映射是自动生成的~~ 【已修复 2025-12-17】
+### 7. 寄存器地址映射 - LLHD 方言支持有限
 
-已通过 `extractAPBRegisterMappings()` 函数从 LLHD 中提取实际的 APB 寄存器地址。
+`extractAPBRegisterMappings()` 函数为 HW/Seq 方言设计，查找 `seq.firreg` 操作获取寄存器名。
 
-分析模式: `paddr → extract → icmp eq const → and(psel, penable, pwrite, icmp) → mux(and, pwdata, reg)`
+**已支持**: HW/Seq 方言（`seq.firreg` + `comb.mux`）
+**未支持**: LLHD 方言（`llhd.sig` + `llhd.drv`）
 
-现在生成的 MMIO 代码使用真实地址：
-```c
-switch (addr) {
-case 0x00:  /* gpio_sw_data */
-    value = s->gpio_sw_data;
-    break;
-case 0x04:  /* gpio_sw_dir */
-    ...
-}
-```
+对于 LLHD 方言输入，当前使用顺序地址（0x00, 0x04, ...）。
+
+**解决方案**: 扩展 `extractAPBRegisterMappings()` 支持 LLHD 方言的 APB 模式
 
 ## 输入信号处理架构
 
