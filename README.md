@@ -113,6 +113,75 @@ s->result = s->cond ? s->a : s->b;
 
 **解决方案**: 从 LLHD 中提取实际的寄存器地址信息
 
+## 输入信号处理架构
+
+### 核心思路
+
+```
+                    ┌──────────────────┐
+                    │   输入信号分类    │
+                    └────────┬─────────┘
+                             │
+         ┌───────────────────┼───────────────────┐
+         ▼                   ▼                   ▼
+   ┌───────────┐      ┌───────────┐      ┌───────────┐
+   │   时钟    │      │   APB     │      │  GPIO输入  │
+   │  (过滤)   │      │ (MMIO)    │      │ (gpio_in) │
+   └───────────┘      └─────┬─────┘      └─────┬─────┘
+                            │                  │
+                            ▼                  ▼
+                    ┌───────────────────────────────┐
+                    │      Signal Tracing           │
+                    │  追踪: 输入 → 哪些状态被影响   │
+                    └────────────────┬──────────────┘
+                                     │
+                                     ▼
+                    ┌───────────────────────────────┐
+                    │    生成 update_state()        │
+                    │  重新计算所有依赖的组合逻辑    │
+                    └───────────────────────────────┘
+```
+
+### 信号分类与处理方式
+
+| 类型 | 信号示例 | 处理方式 |
+|-----|---------|---------|
+| **时钟** | `pclk`, `pclk_intr`, `dbclk` | 过滤掉，不生成代码 |
+| **复位** | `presetn`, `dbclk_rstn` | 事件处理器 `on_xxx_write()` |
+| **APB 协议** | `psel && penable && pwrite` | Signal Tracing → MMIO write case |
+| **APB 地址** | `paddr` | MMIO offset，提取 case 匹配值 |
+| **APB 数据** | `pwdata` | MMIO 写入值 |
+| **GPIO 输入** | `gpio_ext_porta`, `gpio_in_data` | `qdev_init_gpio_in()` + `update_state()` |
+| **控制信号** | `gpio_int_level_sync`, `scan_mode` | 事件处理器 |
+
+### GPIO 输入处理模式（参考 SiFive GPIO）
+
+```c
+// 初始化时注册输入回调
+qdev_init_gpio_in(DEVICE(s), gpio_top_gpio_input_set, 32);
+
+// 输入变化回调
+static void gpio_top_gpio_input_set(void *opaque, int line, int value)
+{
+    gpio_top_state *s = GPIO_TOP(opaque);
+    s->gpio_ext_porta = deposit32(s->gpio_ext_porta, line, 1, value);
+    gpio_top_update_state(s);  // 重新计算组合逻辑
+}
+
+// update_state: 通过 Signal Tracing 生成
+static void gpio_top_update_state(gpio_top_state *s)
+{
+    // 组合逻辑: gpio_ext_porta → int_level → gpio_int_status
+    s->int_level = /* traced expression */;
+    s->gpio_int_status = s->gpio_int_status_level | s->gpio_int_status_edge;
+
+    // 更新中断输出
+    if (s->gpio_int_status & s->gpio_int_en & ~s->gpio_int_mask) {
+        qemu_irq_raise(s->irq);
+    }
+}
+```
+
 ## 使用方法
 
 ```bash
