@@ -4,6 +4,13 @@
 
 ## 更新日志
 
+### 2025-12-17
+
+**修复问题：**
+1. **统一 `isLoopIterator()` 逻辑**: 修复 `--analyze-clk` 与 `--gen-qemu` 结果不一致问题
+   - 在 `ClkAnalysisResult.cpp` 中添加 `isInSameLoopWithCondition()` 函数
+   - 现在两个 pass 对 `int_k` 的分类一致（CLK_LOOP_ITER，不再错误识别为 CLK_ACCUMULATE）
+
 ### 2025-12-16
 
 **新增功能：**
@@ -72,17 +79,12 @@ s->unnamed = (((s->int_level) >> (arg0)) & 1);
 
 **解决方案**: 改进信号追踪，将中间变量也加入状态结构体
 
-### 3. `--analyze-clk` 与 `--gen-qemu` 结果不一致 【中优先级】
+### ~~3. `--analyze-clk` 与 `--gen-qemu` 结果不一致~~ 【已修复 2025-12-17】
 
-| 指标 | --analyze-clk | --gen-qemu |
-|------|---------------|------------|
-| CLK_ACCUMULATE | 0 | 1 (int_k) |
-
-**原因**: 两个 pass 使用不同的分析逻辑
-- `--analyze-clk` 只分析 drv 操作的模式
-- `--gen-qemu` 内部有额外的计数器检测逻辑
-
-**解决方案**: 统一两个 pass 的分析代码
+已通过统一 `isLoopIterator()` 逻辑修复。现在两个 pass 结果一致：
+- CLK_IGNORABLE: 114
+- CLK_ACCUMULATE: 0
+- CLK_LOOP_ITER: 1
 
 ### 4. 事件处理器覆盖不完整 【低优先级】
 
