@@ -6,6 +6,21 @@
 
 ### 2025-12-17
 
+**新增功能：**
+1. **APB 寄存器地址映射提取**: `extractAPBRegisterMappings()` 函数从 LLHD 中提取实际的 APB 寄存器地址
+   - 分析模式: `paddr → extract → icmp eq const → and(psel, penable, pwrite, icmp) → mux(and, pwdata, reg)`
+   - 自动检测可读/可写属性
+
+2. **GPIO 输入信号分类**: 输入信号现在按类型分类处理
+   - `clock`: 时钟信号（过滤，不生成代码）
+   - `apb`: APB 协议信号（通过 MMIO 处理）
+   - `gpio_in`: GPIO 外部输入（通过 `qdev_init_gpio_in` 处理）
+   - `input`: 普通输入信号（事件触发）
+
+3. **GPIO 输入回调生成**: `generateGPIOInputCallback()` 和 `generateUpdateState()` 函数
+   - 生成 `qdev_init_gpio_in()` 初始化代码
+   - 生成 GPIO 输入变化回调函数
+
 **修复问题：**
 1. **统一 `isLoopIterator()` 逻辑**: 修复 `--analyze-clk` 与 `--gen-qemu` 结果不一致问题
    - 在 `ClkAnalysisResult.cpp` 中添加 `isInSameLoopWithCondition()` 函数
@@ -79,18 +94,13 @@ s->gpio_int_status_level = s->gpio_int_level_sync ? s->int_level : s->int_level_
 - CLK_ACCUMULATE: 0
 - CLK_LOOP_ITER: 1
 
-### 4. 事件处理器覆盖不完整 【低优先级】
+### ~~4. 事件处理器覆盖不完整~~ 【已修复 2025-12-17】
 
-27 个输入信号，但只生成了 2 个事件处理器：
-- `on_presetn_write` (复位信号) - 25 branches
-- `on_gpio_int_level_sync_write` - 2 branches
-
-**未处理的输入信号**：
-- `pclk`, `pclk_int`, `pclk_intr` (时钟信号)
-- `paddr`, `pwdata`, `penable`, `psel`, `pwrite` (APB 总线信号)
-- `gpio_ext_porta`, `gpio_in_data` 等
-
-**说明**: 部分输入信号（如时钟、总线信号）可能不需要事件处理器
+已通过输入信号分类解决。现在输入信号按类型分类处理：
+- **时钟信号** (`pclk`, `pclk_int`, `pclk_intr`): 标记为 `clock`，过滤掉
+- **APB 协议信号** (`paddr`, `pwdata`, `penable`, `psel`, `pwrite`): 标记为 `apb`，通过 MMIO 处理
+- **GPIO 外部输入** (`gpio_ext_porta`, `gpio_in_data`): 标记为 `gpio_in`，通过 `qdev_init_gpio_in` 处理
+- **普通输入** (`presetn`, `gpio_int_level_sync`): 标记为 `input`，生成事件处理器
 
 ### 5. `unnamed` 信号 【低优先级】
 
@@ -107,11 +117,22 @@ s->result = s->cond ? s->a : s->b;
 
 不再需要显式的循环展开。
 
-### 7. 寄存器地址映射是自动生成的 【低优先级】
+### ~~7. 寄存器地址映射是自动生成的~~ 【已修复 2025-12-17】
 
-当前地址映射（0x00, 0x04, 0x08...）是按顺序自动分配的，不是根据实际 APB 寄存器地址
+已通过 `extractAPBRegisterMappings()` 函数从 LLHD 中提取实际的 APB 寄存器地址。
 
-**解决方案**: 从 LLHD 中提取实际的寄存器地址信息
+分析模式: `paddr → extract → icmp eq const → and(psel, penable, pwrite, icmp) → mux(and, pwdata, reg)`
+
+现在生成的 MMIO 代码使用真实地址：
+```c
+switch (addr) {
+case 0x00:  /* gpio_sw_data */
+    value = s->gpio_sw_data;
+    break;
+case 0x04:  /* gpio_sw_dir */
+    ...
+}
+```
 
 ## 输入信号处理架构
 
