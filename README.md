@@ -128,6 +128,31 @@ s->result = s->cond ? s->a : s->b;
 
 **解决方案**: 扩展 `extractAPBRegisterMappings()` 支持 LLHD 方言的 APB 模式
 
+### 8. Signal Tracing / update_state 组合逻辑生成
+
+`generateUpdateState()` 函数当前生成的是硬编码的占位符代码：
+
+```c
+static void gpio_top_update_state(gpio_top_state *s)
+{
+    /* Combinational logic: gpio_ext_porta -> int_level -> gpio_int_status */
+    /* TODO: Add traced combinational expressions here */
+
+    /* Update interrupt output */
+    uint32_t pending = s->gpio_int_status & s->gpio_int_en & ~s->gpio_int_mask;
+    // ...
+}
+```
+
+**问题**: 组合逻辑部分（从 `gpio_ext_porta` 到 `int_level` 到 `gpio_int_status` 的信号传播）需要从 LLHD IR 自动追踪生成。
+
+**需要实现**:
+1. 从 GPIO 输入信号开始，追踪所有依赖的组合逻辑链
+2. 生成正确的信号传播表达式到 `update_state()` 函数
+3. 确保中断状态正确更新
+
+**相关代码**: [QEMUCodeGen.cpp:841-861](src/lib/QEMUCodeGen.cpp#L841-L861)
+
 ## 输入信号处理架构
 
 ### 核心思路
