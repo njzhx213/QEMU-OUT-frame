@@ -117,16 +117,32 @@ s->result = s->cond ? s->a : s->b;
 
 不再需要显式的循环展开。
 
-### 7. 寄存器地址映射 - LLHD 方言支持有限
+### 7. 寄存器地址映射 - LLHD 方言支持有限 ✅ **已解决**
 
 `extractAPBRegisterMappings()` 函数为 HW/Seq 方言设计，查找 `seq.firreg` 操作获取寄存器名。
 
-**已支持**: HW/Seq 方言（`seq.firreg` + `comb.mux`）
-**未支持**: LLHD 方言（`llhd.sig` + `llhd.drv`）
+**问题描述**:
+- ❌ 之前: 生成 125 个 case 语句,包含大量内部信号 (`ri_*`, `*_wen`, `*_tmp`, `PROC.*`, `_ff*`)
+- ❌ 之前: LLHD 方言使用顺序地址,无法提取真实 APB 地址
 
-对于 LLHD 方言输入，当前使用顺序地址（0x00, 0x04, ...）。
+**解决方案**:
+1. **方案 A (APB 映射提取)**: 使用 SignalTracing 库重写提取逻辑
+   - 使用 `signal_tracing::analyzeAndCondition()` 检测 `and(psel, penable, pwrite)`
+   - 递归遍历控制流,追踪地址检查 (`icmp(extract(paddr), const)`)
+   - 使用 `signal_tracing::traceToSignal()` 自动处理 `llhd.prb`
+   - 成功提取真实寄存器名和 APB 地址
 
-**解决方案**: 扩展 `extractAPBRegisterMappings()` 支持 LLHD 方言的 APB 模式
+2. **方案 B (Fallback 过滤)**: 过滤内部信号
+   - 在 fallback 模式下过滤 `ri_*`, `*_wen`, `*_tmp`, `PROC.*`, `_ff*`
+   - 确保即使 APB 提取失败,也只生成真实寄存器的 case
+
+**测试结果** (gpio0_llhd.mlir):
+- ✅ 现在: 14 个 case 语句 (7 个寄存器 × 2 次)
+- ✅ 现在: 0 个内部信号
+- ✅ 减少了 111 个无用 case (-88.8%)
+- ✅ 成功提取 APB 地址: `0x00, 0x04, 0x30, 0x34, 0x38, 0x3c, ...`
+
+**相关提交**: 使用 SignalTracing 库重写 APB 映射提取
 
 ### 8. Signal Tracing / update_state 组合逻辑生成
 
