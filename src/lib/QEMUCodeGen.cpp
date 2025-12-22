@@ -359,9 +359,13 @@ void QEMUDeviceGenerator::generateMMIORead(llvm::raw_ostream &os) {
       os << "        break;\n";
     }
   } else {
-    // 后备：使用顺序地址
+    // 后备：使用顺序地址，但过滤内部信号
     int offset = 0;
     for (const auto &sig : signals_) {
+      // 跳过内部信号
+      if (isInternalSignal(sig.name))
+        continue;
+
       std::string safeName = sanitizeName(sig.name);
       os << "    case 0x" << llvm::format_hex_no_prefix(offset, 2) << ":  /* " << sig.name << " */\n";
       if (sig.type == QEMUSignalType::ICOUNT_COUNTER) {
@@ -370,8 +374,7 @@ void QEMUDeviceGenerator::generateMMIORead(llvm::raw_ostream &os) {
         os << "        value = s->" << safeName << ";\n";
       }
       os << "        break;\n";
-      offset += (sig.bitWidth + 7) / 8;
-      if (offset % 4 != 0) offset = (offset + 3) & ~3;
+      offset += 4;  // 固定4字节对齐
     }
   }
 
@@ -420,9 +423,13 @@ void QEMUDeviceGenerator::generateMMIOWrite(llvm::raw_ostream &os) {
       os << "        break;\n";
     }
   } else {
-    // 后备：使用顺序地址
+    // 后备：使用顺序地址，但过滤内部信号
     int offset = 0;
     for (const auto &sig : signals_) {
+      // 跳过内部信号
+      if (isInternalSignal(sig.name))
+        continue;
+
       std::string safeName = sanitizeName(sig.name);
       os << "    case 0x" << llvm::format_hex_no_prefix(offset, 2) << ":  /* " << sig.name << " */\n";
       if (sig.type == QEMUSignalType::ICOUNT_COUNTER) {
@@ -440,8 +447,7 @@ void QEMUDeviceGenerator::generateMMIOWrite(llvm::raw_ostream &os) {
       }
 
       os << "        break;\n";
-      offset += (sig.bitWidth + 7) / 8;
-      if (offset % 4 != 0) offset = (offset + 3) & ~3;
+      offset += 4;  // 固定4字节对齐
     }
 
     // 为输入信号生成 MMIO 入口（如果它们不在 signals_ 中）
@@ -733,6 +739,46 @@ const clk_analysis::DerivedSignal* QEMUDeviceGenerator::getDerivedSignal(llvm::S
     }
   }
   return nullptr;
+}
+
+/// 检查信号是否是内部信号（非寄存器）
+bool QEMUDeviceGenerator::isInternalSignal(llvm::StringRef name) const {
+  std::string nameStr = name.str();
+
+  // 过滤 ri_* 前缀（寄存器输入镜像）
+  if (nameStr.find("ri_") == 0)
+    return true;
+
+  // 过滤 *_wen 后缀（写使能）
+  if (nameStr.find("_wen") != std::string::npos)
+    return true;
+
+  // 过滤 *_tmp 后缀（临时变量）
+  if (nameStr.find("_tmp") != std::string::npos)
+    return true;
+
+  // 过滤 PROCESS 内部信号
+  if (nameStr.find("PROC") != std::string::npos || nameStr.find("_ff") != std::string::npos)
+    return true;
+
+  // 过滤 APB 协议信号本身（不应该作为寄存器）
+  if (nameStr == "paddr" || nameStr == "pwdata" || nameStr == "prdata" ||
+      nameStr == "psel" || nameStr == "penable" || nameStr == "pwrite")
+    return true;
+
+  // 过滤时钟和复位信号
+  if (nameStr.find("pclk") != std::string::npos || nameStr == "presetn")
+    return true;
+
+  // 过滤内部逻辑信号（常见模式）
+  if (nameStr.find("int_edge") != std::string::npos ||
+      nameStr.find("int_level_ff") != std::string::npos ||
+      nameStr.find("int_clk_en") != std::string::npos ||
+      nameStr.find("zero_value") != std::string::npos ||
+      nameStr.find("int_k") != std::string::npos)
+    return true;
+
+  return false;
 }
 
 /// 生成信号读取表达式（对 ptimer 计数器和派生信号使用 get_ 函数）

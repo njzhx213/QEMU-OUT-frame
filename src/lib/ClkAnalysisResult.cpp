@@ -1131,195 +1131,323 @@ ModuleAnalysisResult analyzeModuleWithEvents(mlir::ModuleOp mod) {
 }
 
 //===----------------------------------------------------------------------===//
-// APB 寄存器地址映射提取
+// APB 寄存器地址映射提取（使用 SignalTracing 库）
 //===----------------------------------------------------------------------===//
 
 /// 从模块中提取 APB 寄存器地址映射
-/// 分析模式: paddr → extract → icmp eq const → and(psel, penable, pwrite, icmp) → mux(and, pwdata, reg)
+/// 新策略: 使用 SignalTracing 库追踪 and(psel, penable, pwrite) → cond_br → drv
 void extractAPBRegisterMappings(ModuleOp mod,
                                  std::vector<APBRegisterMapping> &mappings) {
+  using namespace signal_tracing;
+
   // 遍历所有模块
   mod.walk([&](hw::HWModuleOp hwMod) {
-    // 用于存储: icmp结果Value → (地址值, 地址偏移位数)
-    llvm::DenseMap<Value, std::pair<int64_t, int>> icmpToAddress;
-    // 用于存储: and结果Value → 地址值
-    llvm::DenseMap<Value, int64_t> andToAddress;
+    unsigned andCount = 0, apbAndCount = 0, extractedCount = 0;
 
-    // 第一遍: 找到所有 paddr 相关的 icmp
-    hwMod.walk([&](comb::ICmpOp icmp) {
-      if (icmp.getPredicate() != comb::ICmpPredicate::eq)
-        return;
-
-      // 检查是否比较的是常量
-      Value lhs = icmp.getLhs();
-      Value rhs = icmp.getRhs();
-
-      hw::ConstantOp constOp = nullptr;
-      Value extractVal = nullptr;
-
-      if (auto c = rhs.getDefiningOp<hw::ConstantOp>()) {
-        constOp = c;
-        extractVal = lhs;
-      } else if (auto c = lhs.getDefiningOp<hw::ConstantOp>()) {
-        constOp = c;
-        extractVal = rhs;
-      }
-
-      if (!constOp || !extractVal)
-        return;
-
-      // 检查 extractVal 是否是从 paddr 提取的
-      if (auto extract = extractVal.getDefiningOp<comb::ExtractOp>()) {
-        Value input = extract.getInput();
-        // 检查输入是否是 paddr（可能是 BlockArgument 或命名信号）
-        bool isPaddr = false;
-        if (auto arg = dyn_cast<BlockArgument>(input)) {
-          // 检查参数名
-          if (auto hwMod = dyn_cast<hw::HWModuleOp>(arg.getOwner()->getParentOp())) {
-            auto moduleType = hwMod.getHWModuleType();
-            auto ports = moduleType.getPorts();
-            unsigned argNum = arg.getArgNumber();
-            // 输入端口索引
-            unsigned inputIdx = 0;
-            for (auto port : ports) {
-              if (port.dir == hw::ModulePort::Direction::Input) {
-                if (inputIdx == argNum) {
-                  if (port.name.str().find("paddr") != std::string::npos) {
-                    isPaddr = true;
-                  }
-                  break;
-                }
-                inputIdx++;
-              }
-            }
-          }
-        }
-
-        if (isPaddr) {
-          int64_t addrVal = constOp.getValue().getSExtValue();
-          int lowBit = extract.getLowBit();
-          icmpToAddress[icmp.getResult()] = {addrVal, lowBit};
-        }
-      }
-    });
-
-    // 第二遍: 找到 and(psel, penable, pwrite, icmp) 模式
+    // 遍历所有 AND 操作
     hwMod.walk([&](comb::AndOp andOp) {
-      // 检查操作数中是否有 psel, penable, pwrite 和 icmp 结果
-      bool hasPsel = false, hasPenable = false, hasPwrite = false;
-      Value icmpResult;
+      andCount++;
 
-      for (Value operand : andOp.getOperands()) {
-        // 检查是否是 BlockArgument (输入信号)
-        if (auto arg = dyn_cast<BlockArgument>(operand)) {
-          if (auto hwMod = dyn_cast<hw::HWModuleOp>(arg.getOwner()->getParentOp())) {
-            auto moduleType = hwMod.getHWModuleType();
-            auto ports = moduleType.getPorts();
-            unsigned argNum = arg.getArgNumber();
-            unsigned inputIdx = 0;
-            for (auto port : ports) {
-              if (port.dir == hw::ModulePort::Direction::Input) {
-                if (inputIdx == argNum) {
-                  std::string name = port.name.str();
-                  if (name == "psel") hasPsel = true;
-                  else if (name == "penable") hasPenable = true;
-                  else if (name == "pwrite") hasPwrite = true;
+      // 使用 SignalTracing 分析 AND 条件
+      BranchCondition cond = analyzeAndCondition(andOp);
+
+      // 检查是否是 APB 写条件: psel && penable && pwrite
+      bool hasPsel = false, hasPenable = false;
+      for (const auto &ctrl : cond.controls) {
+        if (ctrl.name == "psel" && ctrl.requiredValue) hasPsel = true;
+        if (ctrl.name == "penable" && ctrl.requiredValue) hasPenable = true;
+      }
+
+      if (!hasPsel || !hasPenable || !cond.hasPwrite || !cond.pwriteValue) {
+        return;  // 不是 APB 写条件
+      }
+
+      apbAndCount++;
+
+      // 检查这个 AND 是否用于条件分支
+      if (!andOp.getResult().hasOneUse())
+        return;
+
+      auto *user = *andOp.getResult().getUsers().begin();
+      auto apbCondBr = dyn_cast<cf::CondBranchOp>(user);
+      if (!apbCondBr)
+        return;
+
+      // 递归遍历 true 分支,直接分析 drv 和其所在的控制流
+      llvm::SmallPtrSet<Block*, 16> visited;
+      std::function<void(Block*, std::optional<int64_t>)> analyzeBlock =
+        [&](Block *block, std::optional<int64_t> currentAddr) {
+          if (!block || !visited.insert(block).second)
+            return;
+
+          // 检查这个 block 是否由地址检查条件进入
+          for (auto *pred : block->getPredecessors()) {
+            auto *terminator = pred->getTerminator();
+            if (auto condBr = dyn_cast<cf::CondBranchOp>(terminator)) {
+              // 只有当这是 true 分支时才分析
+              if (condBr.getTrueDest() != block)
+                continue;
+
+              Value cond = condBr.getCondition();
+
+              // 检查是否是 icmp(extract(paddr), const)
+              if (auto icmp = cond.getDefiningOp<comb::ICmpOp>()) {
+                if (icmp.getPredicate() != comb::ICmpPredicate::eq)
+                  continue;
+
+                hw::ConstantOp constOp = nullptr;
+                Value extractVal = nullptr;
+
+                if (auto c = icmp.getRhs().getDefiningOp<hw::ConstantOp>()) {
+                  constOp = c;
+                  extractVal = icmp.getLhs();
+                } else if (auto c = icmp.getLhs().getDefiningOp<hw::ConstantOp>()) {
+                  constOp = c;
+                  extractVal = icmp.getRhs();
+                }
+
+                if (constOp) {
+                  // 检查是否是从 paddr 提取
+                  if (auto extract = extractVal.getDefiningOp<comb::ExtractOp>()) {
+                    TracedSignal paddrSig = traceToSignal(extract.getInput());
+                    if (paddrSig.isValid() && paddrSig.name.contains("paddr")) {
+                      // 使用无符号扩展,因为地址是无符号的
+                      // -8 (i5 有符号) = 24 (无符号) → 字节地址 0x60
+                      currentAddr = constOp.getValue().getZExtValue();
+                      llvm::errs() << "[DEBUG]     Found address: " << *currentAddr << "\n";
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          // 遍历 block 中的所有操作
+          for (Operation &op : *block) {
+            // 处理 drv 操作
+            if (auto drv = dyn_cast<llhd::DrvOp>(&op)) {
+              Value target = drv.getSignal();
+              std::string regName;
+
+              // 获取信号名
+              if (auto sigOp = target.getDefiningOp<llhd::SignalOp>()) {
+                if (auto nameAttr = sigOp->getAttrOfType<StringAttr>("name")) {
+                  llvm::StringRef signalName = nameAttr.getValue();
+
+                  // 跳过非写使能信号
+                  if (signalName.find("_wen") == llvm::StringRef::npos)
+                    continue;
+
+                  llvm::errs() << "[DEBUG]   Drive to: " << signalName << " at address: "
+                               << (currentAddr ? std::to_string(*currentAddr) : "unknown") << "\n";
+
+                  // 去掉 _wen 后缀
+                  regName = signalName.str();
+                  size_t wenPos = regName.find("_wen");
+                  if (wenPos != std::string::npos) {
+                    regName = regName.substr(0, wenPos);
+                  }
+                }
+              }
+
+              if (regName.empty() || !currentAddr)
+                continue;
+
+              // 计算字节地址
+              uint32_t byteAddr = static_cast<uint32_t>(*currentAddr) << 2;
+
+              // 添加到映射
+              bool found = false;
+              for (auto &mapping : mappings) {
+                if (mapping.address == byteAddr) {
+                  found = true;
+                  mapping.isWritable = true;
+                  if (mapping.registerName.empty())
+                    mapping.registerName = regName;
                   break;
                 }
-                inputIdx++;
+              }
+
+              if (!found) {
+                APBRegisterMapping mapping;
+                mapping.address = byteAddr;
+                mapping.registerName = regName;
+                mapping.bitWidth = 32;
+                mapping.isWritable = true;
+                mapping.isReadable = true;
+                mappings.push_back(mapping);
+                extractedCount++;
               }
             }
-          }
-        }
-        // 检查是否是 icmp 结果
-        if (icmpToAddress.count(operand)) {
-          icmpResult = operand;
-        }
-      }
 
-      // 如果是 APB 写条件模式
-      if (hasPsel && hasPenable && hasPwrite && icmpResult) {
-        andToAddress[andOp.getResult()] = icmpToAddress[icmpResult].first;
-      }
+            // 递归处理条件分支
+            if (auto condBr = dyn_cast<cf::CondBranchOp>(&op)) {
+              analyzeBlock(condBr.getTrueDest(), currentAddr);
+              analyzeBlock(condBr.getFalseDest(), currentAddr);
+            }
+
+            // 递归处理无条件分支
+            if (auto br = dyn_cast<cf::BranchOp>(&op)) {
+              analyzeBlock(br.getDest(), currentAddr);
+            }
+          }
+        };
+
+      // 从 APB 条件的 true 分支开始分析
+      analyzeBlock(apbCondBr.getTrueDest(), std::nullopt);
     });
 
-    // 第三遍: 找到 mux(and, pwdata, reg) 模式
-    hwMod.walk([&](comb::MuxOp mux) {
-      Value cond = mux.getCond();
-      if (!andToAddress.count(cond))
+    llvm::errs() << "[DEBUG] APB Write extraction: checked " << andCount
+                 << " AND ops, found " << apbAndCount
+                 << " APB write conditions, extracted " << extractedCount << " mappings\n";
+
+    // ========================================================================
+    // 第二遍: 提取 APB 读取寄存器 (只读寄存器)
+    // 策略: 直接查找所有 drv prdata 操作,然后向上追溯地址检查
+    // ========================================================================
+    unsigned prdataDrvCount = 0, readExtractedCount = 0;
+
+    hwMod.walk([&](llhd::DrvOp drv) {
+      Value target = drv.getSignal();
+
+      // 检查是否是 drv prdata
+      std::string targetName;
+      if (auto sigOp = target.getDefiningOp<llhd::SignalOp>()) {
+        if (auto nameAttr = sigOp->getAttrOfType<StringAttr>("name")) {
+          targetName = nameAttr.getValue().str();
+        }
+      }
+
+      if (targetName != "prdata")
         return;
 
-      int64_t addrVal = andToAddress[cond];
-      Value trueVal = mux.getTrueValue();
-      Value falseVal = mux.getFalseValue();
+      prdataDrvCount++;
 
-      // trueVal 应该是 pwdata, falseVal 应该是寄存器当前值
-      // 检查 trueVal 是否是 pwdata
-      bool isPwdata = false;
-      if (auto arg = dyn_cast<BlockArgument>(trueVal)) {
-        if (auto hwMod = dyn_cast<hw::HWModuleOp>(arg.getOwner()->getParentOp())) {
-          auto moduleType = hwMod.getHWModuleType();
-          auto ports = moduleType.getPorts();
-          unsigned argNum = arg.getArgNumber();
-          unsigned inputIdx = 0;
-          for (auto port : ports) {
-            if (port.dir == hw::ModulePort::Direction::Input) {
-              if (inputIdx == argNum) {
-                if (port.name.str().find("pwdata") != std::string::npos) {
-                  isPwdata = true;
+      // 找到了 drv prdata,分析它的值来自哪个寄存器
+      Value drvValue = drv.getValue();
+
+      // 使用 SignalTracing 追踪值的来源
+      TracedSignal sourceReg = traceToSignal(drvValue);
+
+      if (!sourceReg.isValid())
+        return;
+
+      std::string regName = sourceReg.name.str();
+
+      // 去掉 ri_ 前缀 (ri_gpio_int_status → gpio_int_status)
+      if (regName.find("ri_") == 0) {
+        regName = regName.substr(3);
+      }
+
+      // 向上追溯,找到地址检查条件
+      Block *drvBlock = drv->getBlock();
+      std::optional<int64_t> address;
+      llvm::SmallPtrSet<Block*, 16> visited;
+
+      // 向上追溯,查找最近的地址检查
+      std::function<void(Block*)> findAddress;
+      findAddress = [&](Block *block) {
+        if (!block || visited.count(block) || address.has_value())
+          return;
+        visited.insert(block);
+
+        // 检查进入此 block 的条件分支
+        for (auto *pred : block->getPredecessors()) {
+          auto *terminator = pred->getTerminator();
+          if (auto condBr = dyn_cast<cf::CondBranchOp>(terminator)) {
+            if (condBr.getTrueDest() != block)
+              continue;
+
+            Value cond = condBr.getCondition();
+
+            // 检查是否是地址比较 icmp(paddr, const) 或 icmp(concat/extract(paddr), const)
+            if (auto icmp = cond.getDefiningOp<comb::ICmpOp>()) {
+              if (icmp.getPredicate() != comb::ICmpPredicate::eq &&
+                  icmp.getPredicate() != comb::ICmpPredicate::ceq)
+                continue;
+
+              hw::ConstantOp constOp = nullptr;
+              Value compareVal = nullptr;
+
+              if (auto c = icmp.getRhs().getDefiningOp<hw::ConstantOp>()) {
+                constOp = c;
+                compareVal = icmp.getLhs();
+              } else if (auto c = icmp.getLhs().getDefiningOp<hw::ConstantOp>()) {
+                constOp = c;
+                compareVal = icmp.getRhs();
+              }
+
+              if (!constOp)
+                continue;
+
+              // 检查 compareVal 是否与 paddr 相关
+              bool isPaddrRelated = false;
+
+              // 情况 1: concat(0, extract(paddr))
+              if (auto concat = compareVal.getDefiningOp<comb::ConcatOp>()) {
+                for (auto operand : concat.getOperands()) {
+                  if (auto extract = operand.getDefiningOp<comb::ExtractOp>()) {
+                    TracedSignal sig = traceToSignal(extract.getInput());
+                    if (sig.isValid() && sig.name.contains("paddr")) {
+                      isPaddrRelated = true;
+                      break;
+                    }
+                  }
                 }
-                break;
               }
-              inputIdx++;
-            }
-          }
-        }
-      }
+              // 情况 2: extract(paddr)
+              else if (auto extract = compareVal.getDefiningOp<comb::ExtractOp>()) {
+                TracedSignal sig = traceToSignal(extract.getInput());
+                if (sig.isValid() && sig.name.contains("paddr")) {
+                  isPaddrRelated = true;
+                }
+              }
+              // 情况 3: 直接是 paddr
+              else {
+                TracedSignal sig = traceToSignal(compareVal);
+                if (sig.isValid() && sig.name.contains("paddr")) {
+                  isPaddrRelated = true;
+                }
+              }
 
-      if (!isPwdata)
-        return;
-
-      // falseVal 应该是寄存器名
-      std::string regName;
-      // 尝试从 seq.firreg 获取名称
-      for (auto *user : mux.getResult().getUsers()) {
-        if (auto firreg = dyn_cast<seq::FirRegOp>(user)) {
-          if (auto nameAttr = firreg->getAttrOfType<StringAttr>("name")) {
-            regName = nameAttr.getValue().str();
-          } else {
-            // 使用 SSA 名称
-            std::string str;
-            llvm::raw_string_ostream os(str);
-            firreg.getResult().print(os);
-            os.flush();
-            if (!str.empty() && str[0] == '%') {
-              size_t end = str.find_first_of(" :");
-              if (end != std::string::npos) {
-                regName = str.substr(1, end - 1);
-              } else {
-                regName = str.substr(1);
+              if (isPaddrRelated) {
+                address = constOp.getValue().getZExtValue();
+                return;
               }
             }
           }
-          break;
+
+          // 继续向上追溯
+          findAddress(pred);
         }
+      };
+
+      findAddress(drvBlock);
+
+      if (!address) {
+        llvm::errs() << "[DEBUG]   Read from: " << regName << " (no address found)\n";
+        return;
       }
 
-      if (regName.empty())
-        return;
+      llvm::errs() << "[DEBUG]   Read from: " << regName << " at address: " << *address << "\n";
 
-      // 计算字节地址 (假设从 bit 2 提取)
-      uint32_t byteAddr = static_cast<uint32_t>(addrVal) << 2;
+      // 计算字节地址
+      uint32_t byteAddr = static_cast<uint32_t>(*address) << 2;
 
-      // 检查是否已存在
+      // 添加到映射或更新现有映射
       bool found = false;
       for (auto &mapping : mappings) {
         if (mapping.address == byteAddr) {
           found = true;
+          mapping.isReadable = true;
+          // 如果已有写入映射但寄存器名不同,可能是读写不同寄存器
           if (mapping.registerName.empty()) {
             mapping.registerName = regName;
+          } else if (mapping.registerName != regName) {
+            llvm::errs() << "[WARNING] Address conflict at 0x";
+            llvm::errs().write_hex(byteAddr);
+            llvm::errs() << ": write=" << mapping.registerName << ", read=" << regName << "\n";
           }
-          mapping.isWritable = true;
           break;
         }
       }
@@ -1328,13 +1456,73 @@ void extractAPBRegisterMappings(ModuleOp mod,
         APBRegisterMapping mapping;
         mapping.address = byteAddr;
         mapping.registerName = regName;
-        mapping.bitWidth = mux.getType().getIntOrFloatBitWidth();
-        mapping.isWritable = true;
+        mapping.bitWidth = 32;
+        mapping.isWritable = false;  // 只读
         mapping.isReadable = true;
         mappings.push_back(mapping);
+        readExtractedCount++;
       }
     });
+
+    llvm::errs() << "[DEBUG] APB Read extraction: found " << prdataDrvCount
+                 << " prdata drives, extracted " << readExtractedCount << " read-only mappings\n";
   });
+
+  // 过滤内部信号（非真实寄存器）
+  auto isInternalSignal = [](const std::string &name) -> bool {
+    // 过滤 ri_* 前缀（寄存器输入镜像）
+    if (name.find("ri_") == 0)
+      return true;
+
+    // 过滤 *_wen 后缀（写使能）
+    if (name.find("_wen") != std::string::npos)
+      return true;
+
+    // 过滤 *_tmp 后缀（临时变量）
+    if (name.find("_tmp") != std::string::npos)
+      return true;
+
+    // 过滤 PROCESS 内部信号
+    if (name.find("PROC") != std::string::npos || name.find("_ff") != std::string::npos)
+      return true;
+
+    // 过滤 APB 协议信号本身（不应该作为寄存器）
+    if (name == "paddr" || name == "pwdata" || name == "prdata" ||
+        name == "psel" || name == "penable" || name == "pwrite")
+      return true;
+
+    // 过滤时钟和复位信号
+    if (name.find("pclk") != std::string::npos || name == "presetn")
+      return true;
+
+    // 过滤内部逻辑信号（常见模式）
+    if (name.find("int_edge") != std::string::npos ||
+        name.find("int_level_ff") != std::string::npos ||
+        name.find("int_clk_en") != std::string::npos ||
+        name.find("zero_value") != std::string::npos)
+      return true;
+
+    return false;
+  };
+
+  // 应用过滤
+  size_t beforeFilter = mappings.size();
+  mappings.erase(
+    std::remove_if(mappings.begin(), mappings.end(),
+      [&](const APBRegisterMapping &m) { return isInternalSignal(m.registerName); }),
+    mappings.end()
+  );
+
+  // 调试输出
+  llvm::errs() << "APB Register Mappings: extracted " << beforeFilter
+               << ", after filter: " << mappings.size() << "\n";
+  for (const auto &mapping : mappings) {
+    llvm::errs() << "  0x";
+    llvm::errs().write_hex(mapping.address);
+    llvm::errs() << ": " << mapping.registerName
+                 << " (R:" << (mapping.isReadable ? "Y" : "N")
+                 << " W:" << (mapping.isWritable ? "Y" : "N") << ")\n";
+  }
 
   // 按地址排序
   std::sort(mappings.begin(), mappings.end(),
