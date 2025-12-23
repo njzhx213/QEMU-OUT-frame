@@ -7,6 +7,7 @@
 ### 2025-12-23
 
 **解决的问题：**
+- ✅ **Issue #5 解决** - `unnamed` 信号已消除（循环展开简化 + SSA 名称后备）
 - ✅ **Issue #7 架构完善** - 统一使用纯功能分析方案
 - ✅ **Issue #9 解决** - 输入信号数据流分析（不再依赖名字匹配）
 
@@ -223,9 +224,11 @@ s->gpio_int_status_level = s->gpio_int_level_sync ? s->int_level : s->int_level_
 - **GPIO 外部输入** (`gpio_ext_porta`, `gpio_in_data`): 标记为 `gpio_in`，通过 `qdev_init_gpio_in` 处理
 - **普通输入** (`presetn`, `gpio_int_level_sync`): 标记为 `input`，生成事件处理器
 
-### 5. `unnamed` 信号 【低优先级】
+### ~~5. `unnamed` 信号~~ 【已修复】
 
-存在一个名为 `unnamed` 的信号（gpio_top.c:286），说明某些 LLHD 信号没有正确命名
+~~存在一个名为 `unnamed` 的信号（gpio_top.c:286），说明某些 LLHD 信号没有正确命名~~
+
+已通过循环展开简化和 SSA 名称后备机制修复。当前生成的代码中不再有 `unnamed` 信号。
 
 ### ~~6. Generate/For 循环展开~~ 【已修复 2025-12-17】
 
