@@ -813,6 +813,148 @@ qemu-output/
 └─────────────────┘
 ```
 
+## 信号分析框架详解
+
+信号类型分析是 LLHD 到 QEMU 转换的核心环节。框架采用**四层递进式分析**，每层从不同角度分析信号特征，最终综合判断信号类型。
+
+### 设计理念
+
+**核心原则：纯功能分析，不依赖信号名字**
+
+传统方法通过名字匹配（如 `*_wen`、`pclk`、`presetn`）识别信号类型，存在以下问题：
+- 不同设计可能使用不同命名规范
+- 名字可能被混淆或简写
+- 无法处理自动生成的中间信号
+
+本框架通过分析信号在电路中的**实际行为**来推断类型，具有更好的通用性和准确性。
+
+### 四层分析方案
+
+#### 方案1：拓扑角色分析 (`analyzeSignalRole`)
+
+**分析维度**：信号在电路拓扑中的连接角色
+
+```
+信号 ──┬── 是模块输入端口？ ────────────→ ModuleInput
+       │
+       ├── 只用于 cf.cond_br 条件？ ───→ ControlFlow
+       │
+       ├── 只用于 icmp 比较？ ──────────→ AddressSelector
+       │
+       ├── 用于 drv 的 value？ ────────→ DataTransfer
+       │
+       └── 既被 drv 写也被 prb 读？ ───→ IntermediateValue
+```
+
+**用途**：快速过滤明显不是寄存器的信号（如纯控制流信号）
+
+#### 方案2：使用模式识别
+
+**分析维度**：信号的读写模式和跨 process 使用情况
+
+| 函数 | 检测目标 | 判断条件 |
+|------|----------|----------|
+| `isInternalSignalByUsagePattern` | 内部中间信号 | 非端口 + 单一 drv 写入 + 不跨 process |
+| `isClockSignalByUsagePattern` | 时钟候选信号 | 单比特 + 在敏感列表 + 无逻辑驱动 |
+
+**用途**：识别可以安全过滤的内部信号，筛选时钟候选
+
+#### 方案3：数据流分析
+
+**分析维度**：信号值的来源和去向
+
+| 函数 | 检测目标 | 数据流特征 |
+|------|----------|------------|
+| `isGPIOInputByDataFlow` | GPIO 输入 | 端口 → prb → 组合逻辑 → drv 内部寄存器 |
+| `isWriteEnableByDataFlow` | 写使能信号 | and(psel,penable,pwrite) → 地址检查 → drv |
+
+**用途**：区分功能相似但用途不同的信号
+
+#### 触发效果分析 (`isClockByTriggerEffect`)
+
+**分析维度**：信号边沿触发时产生的状态变化
+
+这是区分**时钟**和**复位**信号的关键：
+
+```
+┌─────────────────────────────────────────────────────┐
+│ 信号满足方案2的时钟候选条件（单比特、敏感列表、无驱动）│
+└───────────────────────┬─────────────────────────────┘
+                        │
+                        ▼
+         ┌──────────────────────────────┐
+         │ 分析触发后的 drv 操作         │
+         │ analyzeTriggerBranchEffects() │
+         └──────────────┬───────────────┘
+                        │
+        ┌───────────────┴───────────────┐
+        ▼                               ▼
+┌───────────────────┐         ┌───────────────────┐
+│ 所有 drv 都是     │         │ 存在状态修改      │
+│ hold 模式         │         │ (如 counter = 0)  │
+│ (reg = prb reg)   │         │                   │
+└─────────┬─────────┘         └─────────┬─────────┘
+          │                             │
+          ▼                             ▼
+    ┌───────────┐                ┌───────────┐
+    │  时钟信号  │                │  复位信号  │
+    │  (可过滤)  │                │  (需保留)  │
+    └───────────┘                └───────────┘
+```
+
+**核心函数**：
+- `isDrvHoldPattern(drv)` - 检查是否是 `reg = prb reg` 形式
+- `collectBranchDrvEffects()` - 递归收集分支中的 drv 效果
+- `TriggerBranchEffect` - 记录 hold/modify 操作统计
+
+### 分析流程示例
+
+以 `pclk`（时钟）和 `presetn`（复位）为例：
+
+```
+pclk 信号分析:
+├── 方案2: isClockSignalByUsagePattern → true (单比特、敏感列表、无驱动)
+└── 触发效果: isClockByTriggerEffect
+    ├── 分析边沿触发的 drv 操作
+    ├── 所有 drv 都是 hold 模式: reg = prb reg
+    └── 结论: 是时钟信号 ✓ (可过滤)
+
+presetn 信号分析:
+├── 方案2: isClockSignalByUsagePattern → true (结构特征相同)
+└── 触发效果: isClockByTriggerEffect
+    ├── 分析边沿触发的 drv 操作
+    ├── 发现状态修改: gpio_int_en = 0, counter = 0
+    └── 结论: 不是时钟信号 ✗ (是复位信号，需保留)
+```
+
+### 综合类型推断
+
+最终通过 `inferSignalTypeByDataFlow()` 综合所有分析结果：
+
+```cpp
+enum class SignalTypeByDataFlow {
+  GPIOInput,         // GPIO 外部输入 → qdev_init_gpio_in()
+  WriteEnable,       // 写使能信号 → 内部过滤
+  APBProtocol,       // APB 协议信号 → MMIO 处理
+  ClockReset,        // 时钟信号 → 过滤（复位不在此类）
+  InternalRegister,  // 内部寄存器 → 内部过滤
+  StateRegister,     // 状态寄存器 → 生成代码
+};
+```
+
+### 相关代码位置
+
+| 功能 | 文件 | 行号 |
+|------|------|------|
+| SignalRole 枚举 | SignalTracing.h | 135-160 |
+| analyzeSignalRole | SignalTracing.h | 162-340 |
+| isClockSignalByUsagePattern | SignalTracing.h | 900-985 |
+| TriggerBranchEffect | SignalTracing.h | 991-1003 |
+| isDrvHoldPattern | SignalTracing.h | 1007-1019 |
+| analyzeTriggerBranchEffects | SignalTracing.h | 1073-1112 |
+| isClockByTriggerEffect | SignalTracing.h | 1117-1129 |
+| inferSignalTypeByDataFlow | SignalTracing.h | 1440-1490 |
+
 ## 示例输出
 
 ### gpio0 模块
