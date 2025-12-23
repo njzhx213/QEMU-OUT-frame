@@ -24,6 +24,7 @@
    - `CLK_COMPLEX` → `STATE_COMPLEX`
 
 3. **完整的信号类型分析框架**:
+   - 方案1: `analyzeSignalRole()` - 基于拓扑角色分析
    - 方案2: `isInternalSignalByUsagePattern()` - 基于使用模式
    - 方案3: `isGPIOInputByDataFlow()`, `isWriteEnableByDataFlow()` - 基于数据流
    - 触发效果分析: `isClockByTriggerEffect()` - 区分时钟 vs 复位
@@ -250,7 +251,21 @@ s->result = s->cond ? s->a : s->b;
 
 采用纯功能分析方案，不依赖信号名字：
 
-**1. 方案2 - 使用模式识别** (`SignalTracing.h`)
+**1. 方案1 - 拓扑角色分析** (`SignalTracing.h:135-340`)
+```cpp
+// 信号拓扑角色（不检查名字，而是分析信号在拓扑中的角色）
+enum class SignalRole {
+  ModuleInput,      // 模块输入端口 (BlockArgument)
+  ControlFlow,      // 控制流信号 (只用于 cf.cond_br 条件)
+  AddressSelector,  // 地址选择 (只用于 icmp 比较)
+  DataTransfer,     // 数据传输 (用于 drv 的 value)
+  IntermediateValue // 内部中间值 (有 drv 写入，也有 prb 读取)
+};
+
+SignalRole analyzeSignalRole(mlir::Value signal);
+```
+
+**2. 方案2 - 使用模式识别** (`SignalTracing.h:1131-1243`)
 ```cpp
 // 内部信号识别（不依赖名字前缀）
 bool isInternalSignalByUsagePattern(mlir::Value signal, hw::HWModuleOp moduleOp) {
@@ -261,7 +276,7 @@ bool isInternalSignalByUsagePattern(mlir::Value signal, hw::HWModuleOp moduleOp)
 }
 ```
 
-**2. 方案3 - 数据流分析** (`SignalTracing.h`)
+**3. 方案3 - 数据流分析** (`SignalTracing.h:1288-1594`)
 ```cpp
 // 写使能信号识别（替代名字匹配 *_wen）
 bool isWriteEnableByDataFlow(mlir::Value signal, hw::HWModuleOp moduleOp) {
@@ -702,6 +717,12 @@ qemu-output/
          ▼
 ┌─────────────────────────────────────────┐
 │         信号类型分析阶段                  │
+│  ┌─────────────────────────────────┐    │
+│  │ 方案1: 拓扑角色分析               │    │
+│  │ - analyzeSignalRole              │    │
+│  │ - SignalRole 枚举推断            │    │
+│  └─────────────────────────────────┘    │
+│                 ▼                        │
 │  ┌─────────────────────────────────┐    │
 │  │ 方案2: 使用模式识别               │    │
 │  │ - isInternalSignalByUsagePattern │    │
