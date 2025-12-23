@@ -4,15 +4,15 @@
 
 ---
 
-## 📁 文件列表
+## 文件列表
 
-- `gpio_top.c` - 完整的 QEMU 设备实现 (571 行)
+- `gpio_top.c` - 完整的 QEMU 设备实现
 - `gpio_top.h` - 设备头文件
 - `README.md` - 本说明文件
 
 ---
 
-## 📊 生成统计
+## 生成统计
 
 ### 寄存器映射
 
@@ -44,29 +44,29 @@
 
 ---
 
-## 🎯 功能特性
+## 功能特性
 
 ### GPIO 基本功能
-✅ GPIO 输出控制 (通过 gpio_sw_data)
-✅ GPIO 方向设置 (通过 gpio_sw_dir)
-✅ GPIO 输入读取 (通过 gpio_ext_data)
+- GPIO 输出控制 (通过 gpio_sw_data)
+- GPIO 方向设置 (通过 gpio_sw_dir)
+- GPIO 输入读取 (通过 gpio_ext_data)
 
 ### 中断功能
-✅ 中断使能/屏蔽控制
-✅ 中断类型配置 (边沿/电平)
-✅ 中断极性设置
-✅ 中断状态读取
-✅ 原始中断状态读取
+- 中断使能/屏蔽控制
+- 中断类型配置 (边沿/电平)
+- 中断极性设置
+- 中断状态读取
+- 原始中断状态读取
 
 ### 高级功能
-✅ 防抖配置读取
-✅ 中断电平同步控制
-✅ GPIO 输入事件处理
-✅ 中断输出信号
+- 防抖配置读取
+- 中断电平同步控制
+- GPIO 输入事件处理
+- 中断输出信号
 
 ---
 
-## 🔧 使用方法
+## 使用方法
 
 ### 1. 集成到 QEMU
 
@@ -91,7 +91,7 @@ qemu-system-arm -device gpio_top,address=0x40000000
 
 ---
 
-## 📝 代码结构
+## 代码结构
 
 ### 核心数据结构
 
@@ -139,39 +139,49 @@ static void gpio_top_reset(DeviceState *dev);
 
 ---
 
-## ⚙️ 提取技术细节
+## 提取技术细节
 
-### 提取方法
+### 信号类型分析框架（纯功能分析，不依赖名字）
 
-本代码使用以下技术从 LLHD IR 自动提取:
+1. **方案1 - 拓扑角色分析** (`analyzeSignalRole`)
+   - 分析信号在拓扑中的角色（ModuleInput, ControlFlow, AddressSelector, DataTransfer, IntermediateValue）
+   - 不依赖信号名字，只检查信号的使用方式
 
-1. **APB 写入寄存器提取**
+2. **方案2 - 使用模式识别**
+   - `isInternalSignalByUsagePattern()` - 检测内部信号（只有一个 drv 写入点，不跨 process）
+   - `isClockSignalByUsagePattern()` - 检测时钟候选信号（单比特，敏感列表，无逻辑驱动）
+
+3. **方案3 - 数据流分析**
+   - `isGPIOInputByDataFlow()` - GPIO 输入信号检测
+   - `isWriteEnableByDataFlow()` - 写使能信号检测
+
+4. **触发效果分析**（区分时钟 vs 复位）
+   - `isClockByTriggerEffect()` - 时钟：触发的所有 drv 都是 hold 模式
+   - 复位信号：触发的 drv 有状态修改（如 counter = 0）
+
+### APB 寄存器提取
+
+1. **写入寄存器提取**
    - 检测 `and(psel, penable, pwrite)` 模式
    - 追踪地址检查 `icmp(extract(paddr), const)`
-   - 提取 `drv *_wen` 信号并去除后缀
+   - 追踪 true 分支中的 drv 操作
 
 2. **只读寄存器提取**
    - 直接搜索所有 `drv prdata` 操作
    - 使用 `traceToSignal()` 追踪值来源
    - 向上递归查找地址检查条件
-   - 去除 `ri_` 前缀
-
-3. **信号分类与过滤**
-   - 自动过滤内部信号 (ri_*, *_wen, *_tmp, PROC.*, _ff*)
-   - 分类时钟、复位、APB 协议信号
-   - 识别 GPIO 输入信号
 
 ### 代码质量
 
-- ✅ 0 个内部信号 (100% 过滤)
-- ✅ 11 个真实寄存器
-- ✅ 正确的读写权限
-- ✅ 准确的地址映射
-- ✅ 完整的事件处理
+- 0 个内部信号泄漏 (100% 过滤)
+- 11 个真实寄存器
+- 正确的读写权限
+- 准确的地址映射
+- 完整的事件处理
 
 ---
 
-## 🐛 已知问题
+## 已知问题
 
 ### 1. 地址冲突
 
@@ -187,10 +197,9 @@ static void gpio_top_reset(DeviceState *dev);
 
 ---
 
-## 📈 性能与统计
+## 性能与统计
 
 ### 代码规模
-- 总行数: 571 行
 - MMIO Read cases: 11 个
 - MMIO Write cases: 7 个
 - 事件处理器: 2 个
@@ -205,7 +214,7 @@ static void gpio_top_reset(DeviceState *dev);
 
 ---
 
-## 📚 参考资料
+## 参考资料
 
 ### 相关文档
 - [LLHD IR 规范](https://llhd.io/)
@@ -213,18 +222,11 @@ static void gpio_top_reset(DeviceState *dev);
 - [APB 协议规范](https://developer.arm.com/documentation/ihi0024/latest/)
 
 ### 源文件
-- 输入: `verilog/gpio0_llhd.mlir`
-- 工具: `qemu-transfer/build/dff-opt`
-- 详细报告: `../EXTRACTION_TEST_RESULTS.md`
+- 输入: `gpio0_llhd.mlir`
+- 工具: `dff-opt --gen-qemu`
 
 ---
 
-## 📞 联系与反馈
-
-如有问题或建议,请参考项目文档或提交 issue。
-
----
-
-**生成时间**: 2025-12-22
+**生成时间**: 2025-12-23
 **工具版本**: dff-opt (LLHD to QEMU Converter)
 **覆盖率**: 91.7% (11/12 寄存器)
