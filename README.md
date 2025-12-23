@@ -1,6 +1,7 @@
 # LLHD 到 QEMU 设备转换工具
 
 本目录包含从 LLHD IR 自动生成的 QEMU 设备代码。
+目前GPIO0文件夹是根据wujian100的gpio文件生成出来的测试输出
 
 ## 更新日志
 
