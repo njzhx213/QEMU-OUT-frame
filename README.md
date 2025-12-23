@@ -474,6 +474,38 @@ SignalTypeByDataFlow inferSignalTypeByDataFlow(
 
 **相关代码**: [SignalTracing.h:1214-1650](src/lib/SignalTracing.h#L1214-L1650)
 
+### 10. 输入信号注释标注不完整
+
+#### 问题描述
+
+生成的 `.h` 文件中，只有部分输入信号被标注了 `/* input */` 注释。
+
+**当前标注的信号** (6个):
+```c
+uint32_t dbclk;           /* input */
+uint32_t dbclk_rstn;      /* input */
+uint32_t gpio_ext_porta;  /* input */
+uint32_t gpio_in_data;    /* input */
+uint32_t pclk_intr;       /* input */
+uint32_t scan_mode;       /* input */
+```
+
+**缺少标注的信号**:
+- APB 协议信号: `paddr`, `pwdata`, `psel`, `penable`, `pwrite`
+- 时钟信号: `pclk`
+- 复位信号: `presetn`
+
+#### 原因分析
+
+代码生成时只对 `gpio_in` 和 `input` 类型的信号添加了 `/* input */` 注释，而 APB 协议信号、时钟信号和复位信号虽然也是模块输入，但未被标注。
+
+#### 建议修复
+
+1. 为所有从 LLHD `in` 端口来源的信号添加 `/* input */` 注释
+2. 可选：按信号类型添加更详细的注释，如 `/* input: apb */`、`/* input: clock */`、`/* input: reset */`
+
+**影响**: 低 - 仅影响代码可读性，不影响功能
+
 ## 输入信号处理架构
 
 ### 核心思路
