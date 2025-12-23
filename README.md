@@ -4,6 +4,70 @@
 
 ## 更新日志
 
+### 2025-12-23
+
+**解决的问题：**
+- ✅ **Issue #7 架构完善** - 统一使用纯功能分析方案
+- ✅ **Issue #9 解决** - 输入信号数据流分析（不再依赖名字匹配）
+
+**新增功能：**
+1. **时钟/复位信号纯功能区分**: 实现基于触发效果的信号分类（不再依赖名字）
+   - 时钟信号：触发的所有 drv 操作都是 hold 模式（`reg = prb reg`）
+   - 复位信号：触发的 drv 操作有状态修改（如 `counter = 0`）
+   - 新增 `TriggerBranchEffect` 结构体和 `analyzeTriggerBranchEffects()` 函数
+   - 新增 `isClockByTriggerEffect()` 纯功能检测函数
+
+2. **DrvClassification 枚举重命名**: 更语义化的命名
+   - `CLK_IGNORABLE` → `STATE_UNCHANGED`
+   - `CLK_ACCUMULATE` → `STATE_ACCUMULATE`
+   - `CLK_LOOP_ITER` → `STATE_LOOP_ITER`
+   - `CLK_COMPLEX` → `STATE_COMPLEX`
+
+3. **完整的信号类型分析框架**:
+   - 方案2: `isInternalSignalByUsagePattern()` - 基于使用模式
+   - 方案3: `isGPIOInputByDataFlow()`, `isWriteEnableByDataFlow()` - 基于数据流
+   - 触发效果分析: `isClockByTriggerEffect()` - 区分时钟 vs 复位
+
+**架构改进：**
+1. **两步时钟检测策略**:
+   ```cpp
+   // 第一步：检查基本结构特征
+   if (!isClockSignalByUsagePattern(signal, processOp)) return false;
+
+   // 第二步：检查触发效果（区分时钟和复位）
+   if (isClockByTriggerEffect(signal, processOp)) {
+     // 是时钟，可以过滤
+   } else {
+     // 是复位或控制信号，必须保留
+   }
+   ```
+
+2. **SignalTracing.h 新增函数** (987-1129行):
+   - `isDrvHoldPattern()` - 检查 drv 是否是 hold 模式
+   - `isDrvConstantInit()` - 检查 drv 是否是常量初始化
+   - `collectBranchDrvEffects()` - 递归收集分支中的 drv 效果
+   - `analyzeTriggerBranchEffects()` - 分析触发信号的分支效果
+
+3. **综合信号类型推断**:
+   ```cpp
+   enum class SignalTypeByDataFlow {
+     GPIOInput,         // GPIO 外部输入信号
+     WriteEnable,       // 写使能信号
+     APBProtocol,       // APB 协议信号
+     ClockReset,        // 时钟/复位信号
+     InternalRegister,  // 内部寄存器
+     StateRegister,     // 状态寄存器
+   };
+   ```
+
+**修改的文件**:
+- `SignalTracing.h` - 新增触发分支效果分析、完整数据流分析框架
+- `ClkAnalysisResult.h` - 重命名 DrvClassification 枚举
+- `ClkAnalysisResult.cpp` - 更新 isClockSignalByUsageInModule()
+- `Passes.td` - 更新文档
+- `Passes.cpp` - 更新枚举引用
+- `tool_main.cpp` - 更新输出字符串
+
 ### 2025-12-22
 
 **新增功能：**
@@ -80,7 +144,7 @@
 **修复问题：**
 1. **统一 `isLoopIterator()` 逻辑**: 修复 `--analyze-clk` 与 `--gen-qemu` 结果不一致问题
    - 在 `ClkAnalysisResult.cpp` 中添加 `isInSameLoopWithCondition()` 函数
-   - 现在两个 pass 对 `int_k` 的分类一致（CLK_LOOP_ITER，不再错误识别为 CLK_ACCUMULATE）
+   - 现在两个 pass 对 `int_k` 的分类一致（STATE_LOOP_ITER，不再错误识别为 STATE_ACCUMULATE）
 
 2. **BlockArgument (arg0) 循环展开**: 将循环中的 bit-by-bit 操作简化为整数级别操作
    - 检测 `mux(cond, a[i], b[i])` 模式，简化为 `cond ? a : b`
@@ -146,9 +210,9 @@ s->gpio_int_status_level = s->gpio_int_level_sync ? s->int_level : s->int_level_
 ### ~~3. `--analyze-clk` 与 `--gen-qemu` 结果不一致~~ 【已修复 2025-12-17】
 
 已通过统一 `isLoopIterator()` 逻辑修复。现在两个 pass 结果一致：
-- CLK_IGNORABLE: 114
-- CLK_ACCUMULATE: 0
-- CLK_LOOP_ITER: 1
+- STATE_UNCHANGED: 114
+- STATE_ACCUMULATE: 0
+- STATE_LOOP_ITER: 1
 
 ### ~~4. 事件处理器覆盖不完整~~ 【已修复 2025-12-17】
 
@@ -184,91 +248,73 @@ s->result = s->cond ? s->a : s->b;
 
 #### 解决方案
 
-**方案 A：APB 写寄存器提取** (使用 SignalTracing 库)
+采用纯功能分析方案，不依赖信号名字：
+
+**1. 方案2 - 使用模式识别** (`SignalTracing.h`)
 ```cpp
+// 内部信号识别（不依赖名字前缀）
+bool isInternalSignalByUsagePattern(mlir::Value signal, hw::HWModuleOp moduleOp) {
+  // 1. 不是模块输入端口
+  // 2. 有且仅有一个 drv 写入点
+  // 3. 只在特定 process 内部使用（不跨 process）
+  // 4. 写入后立即被 prb 读取，用于计算另一个值
+}
+```
+
+**2. 方案3 - 数据流分析** (`SignalTracing.h`)
+```cpp
+// 写使能信号识别（替代名字匹配 *_wen）
+bool isWriteEnableByDataFlow(mlir::Value signal, hw::HWModuleOp moduleOp) {
+  // 1. 数据来源: and(psel, penable, pwrite) → 地址检查 → drv
+  // 2. 使用方式: prb → 用作 mux 的条件选择
+  // 3. 不是最终的寄存器状态（只是控制信号）
+}
+
+// GPIO 输入信号识别
+bool isGPIOInputByDataFlow(mlir::Value signal, hw::HWModuleOp moduleOp) {
+  // 1. 是模块输入端口
+  // 2. 数据流向: port → prb → 组合逻辑 → drv 内部寄存器
+  // 3. 不参与地址选择（不用于 icmp）
+  // 4. 不参与控制流（不用于 and/or 形成条件）
+}
+```
+
+**3. APB 寄存器地址提取** (`ClkAnalysisResult.cpp`)
+```cpp
+// 写寄存器提取
 // 1. 检测 APB 写条件: and(psel, penable, pwrite)
-BranchCondition cond = signal_tracing::analyzeAndCondition(andOp);
-
 // 2. 追踪 true 分支中的驱动操作
-auto actions = signal_tracing::traceTrueBranchDrives(condBr);
+// 3. 递归遍历控制流，查找地址检查 icmp(extract(paddr), const)
+// 4. 使用 getZExtValue() 而非 getSExtValue() 避免符号扩展问题
 
-// 3. 递归遍历控制流，查找地址检查
-std::function<void(Block*, std::optional<int64_t>)> analyzeBlock =
-  [&](Block* block, std::optional<int64_t> currentAddr) {
-    // 检测 icmp(extract(paddr), const)
-    if (auto icmpOp = dyn_cast<comb::ICmpOp>(cond)) {
-      currentAddr = constOp.getValue().getZExtValue();  // 使用无符号扩展
-    }
-
-    // 收集 drv *_wen 操作
-    for (auto& action : actions) {
-      if (action.signalName.ends_with("_wen")) {
-        // 去除 _wen 后缀，得到真实寄存器名
-        regName = action.signalName.substr(0, action.signalName.size() - 4);
-      }
-    }
-  };
-```
-
-**方案 B：只读寄存器提取** ✨ **新增 (2025-12-22)**
-```cpp
+// 只读寄存器提取
 // 1. 直接搜索 drv prdata 操作
-hwMod.walk([&](llhd::DrvOp drv) {
-  if (targetName != "prdata") return;
-
-  // 2. 追踪 prdata 值的来源
-  TracedSignal sourceReg = signal_tracing::traceToSignal(drvValue);
-
-  // 3. 去除 ri_ 前缀
-  if (regName.find("ri_") == 0) {
-    regName = regName.substr(3);
-  }
-
-  // 4. 递归向上查找地址检查
-  std::function<void(Block*)> findAddress = [&](Block* block) {
-    for (Block* pred : block->getPredecessors()) {
-      // 分析前驱块中的条件分支
-      if (auto condBr = dyn_cast<cf::CondBranchOp>(pred->getTerminator())) {
-        // 提取地址常量
-      }
-      findAddress(pred);  // 递归
-    }
-  };
-});
-```
-
-**方案 C：Fallback 内部信号过滤**
-```cpp
-auto isInternalSignal = [](const std::string &name) -> bool {
-  if (name.find("ri_") == 0) return true;        // 寄存器输入镜像
-  if (name.find("_wen") != std::string::npos) return true;  // 写使能
-  if (name.find("_tmp") != std::string::npos) return true;  // 临时变量
-  if (name.find("PROC") != std::string::npos) return true;  // 进程内部
-  if (name.find("_ff") != std::string::npos) return true;   // 触发器
-  return false;
-};
+// 2. 使用 traceToSignal() 追踪 prdata 值的来源
+// 3. 去除 ri_ 前缀获取真实寄存器名
+// 4. 递归向上查找前驱块中的地址检查条件
 ```
 
 #### 技术亮点
 
-1. **SignalTracing 库复用**:
+1. **纯功能分析**（不依赖信号名字）:
+   - `isInternalSignalByUsagePattern()` - 基于使用模式
+   - `isWriteEnableByDataFlow()` - 基于数据流
+   - `isGPIOInputByDataFlow()` - 基于数据流
+
+2. **SignalTracing 库**:
    - `analyzeAndCondition()` - 分析 AND 条件，提取控制信号
    - `traceTrueBranchDrives()` - 追踪 true 分支的驱动操作
    - `traceToSignal()` - 穿透 XOR/PRB 操作，追踪到源信号
 
-2. **递归控制流分析**:
+3. **递归控制流分析**:
    - 向上遍历 block predecessors
    - 在每个前驱块中查找地址检查条件
    - 支持多层嵌套的控制流
 
-3. **多种地址提取模式**:
+4. **多种地址提取模式**:
    - `concat(high, low)` - 拼接模式
    - `extract(paddr, offset)` - 提取模式
    - 直接 `paddr` - 简单模式
-
-4. **智能前缀处理**:
-   - 写寄存器: 去除 `_wen` 后缀 (`gpio_sw_data_wen` → `gpio_sw_data`)
-   - 只读寄存器: 去除 `ri_` 前缀 (`ri_gpio_int_status` → `gpio_int_status`)
 
 #### 最终结果 (gpio0_llhd.mlir)
 
@@ -310,7 +356,7 @@ auto isInternalSignal = [](const std::string &name) -> bool {
 - 2025-12-17: 使用 SignalTracing 库重写 APB 映射提取
 - 2025-12-22: 添加只读寄存器提取，修复地址符号扩展 bug
 
-### 8. Signal Tracing / update_state 组合逻辑生成
+### 8. Signal Tracing / update_state 组合逻辑生成 【进行中】
 
 `generateUpdateState()` 函数当前生成的是硬编码的占位符代码：
 
@@ -333,45 +379,81 @@ static void gpio_top_update_state(gpio_top_state *s)
 2. 生成正确的信号传播表达式到 `update_state()` 函数
 3. 确保中断状态正确更新
 
+**进展** (2025-12-23):
+- ✅ 时钟/复位信号纯功能区分已实现 - 基于触发效果分析，不再依赖信号名
+- ✅ 新增 `TriggerBranchEffect` 和 `analyzeTriggerBranchEffects()` 用于分析触发分支效果
+- ✅ `isDrvHoldPattern()` 可检测 hold 模式 drv 操作
+- 🔄 下一步：利用这些基础设施追踪组合逻辑链并生成表达式
+
 **相关代码**: [QEMUCodeGen.cpp:841-861](src/lib/QEMUCodeGen.cpp#L841-L861)
 
-### 9. 输入信号数据流分析缺失
+### ~~9. 输入信号数据流分析缺失~~ 【✅ 已解决 2025-12-23】
 
-当前输入信号分类是**基于名字匹配**，而不是基于实际的数据流分析：
+#### 问题描述
+原本的输入信号分类是**基于名字匹配**，可能导致误分类。
+
+#### 解决方案
+
+现在已实现三种纯功能分析方案（不依赖名字）：
+
+**方案2: 基于使用模式识别** (`SignalTracing.h:1214-1286`)
+```cpp
+// 内部信号的结构特征：
+// 1. 不是模块输入端口
+// 2. 有且仅有一个 drv 写入点
+// 3. 只在特定 process 内部使用（不跨 process）
+// 4. 写入后立即被 prb 读取，用于计算另一个值
+bool isInternalSignalByUsagePattern(mlir::Value signal, hw::HWModuleOp moduleOp);
+
+// 时钟信号的结构特征：
+// 1. 是 llhd.process 的敏感信号（sig 参数）
+// 2. 在 process 内通过 prb 读取
+// 3. 用于触发状态更新，但自身不被 drv 修改
+bool isClockSignalByUsagePattern(mlir::Value signal, llhd::ProcessOp processOp);
+```
+
+**方案3: 基于数据流依赖分析** (`SignalTracing.h:1288-1650`)
+```cpp
+// GPIO 输入信号的特征：
+// 1. 是模块输入端口
+// 2. 数据流向: port → prb → 组合逻辑 → drv 内部寄存器
+// 3. 不参与地址选择（不用于 icmp）
+// 4. 不参与控制流（不用于 and/or 形成条件）
+bool isGPIOInputByDataFlow(mlir::Value signal, hw::HWModuleOp moduleOp);
+
+// 写使能信号 (_wen) 的特征：
+// 1. 数据来源: and(psel, penable, pwrite) → 地址检查 → drv *_wen
+// 2. 使用方式: prb *_wen → 用作 mux 的条件选择
+// 3. 不是最终的寄存器状态（只是控制信号）
+bool isWriteEnableByDataFlow(mlir::Value signal, hw::HWModuleOp moduleOp);
+```
+
+**触发效果分析** (`SignalTracing.h:987-1129`) - 2025-12-23 新增
+```cpp
+// 时钟 vs 复位信号区分（纯功能）：
+// - 时钟信号：触发的所有 drv 操作都是 hold 模式（reg = prb reg）
+// - 复位信号：触发的 drv 操作有状态修改（如 counter = 0）
+bool isClockByTriggerEffect(mlir::Value signal, llhd::ProcessOp processOp);
+```
+
+#### 综合信号类型推断
 
 ```cpp
-// ClkAnalysisResult.cpp - 纯名字匹配
-bool isClockSignal(const std::string &name) {
-  if (name == "clk" || name == "clock") return true;
-  if (name.find("pclk") == 0) return true;  // 名字前缀匹配
-  ...
-}
+enum class SignalTypeByDataFlow {
+  GPIOInput,         // GPIO 外部输入信号
+  WriteEnable,       // 写使能信号
+  APBProtocol,       // APB 协议信号
+  ClockReset,        // 时钟/复位信号
+  InternalRegister,  // 内部寄存器
+  StateRegister,     // 状态寄存器（可通过 APB 访问）
+};
 
-bool isGPIOInputSignal(const std::string &name) {
-  if (name.find("gpio_ext_port") != std::string::npos) return true;
-  ...
-}
+// 综合所有方案的数据流分析
+SignalTypeByDataFlow inferSignalTypeByDataFlow(
+    mlir::Value signal, hw::HWModuleOp moduleOp, llhd::ProcessOp processOp);
 ```
 
-**问题**:
-1. **无数据流分析** - 不知道输入信号是否真的被使用
-2. **可能误分类** - `pclk_int` 可能不是时钟，但会被名字匹配过滤
-3. **不知道影响范围** - 不知道 `gpio_ext_porta` 会影响哪些内部信号
-
-**需要实现**:
-```
-输入信号 ──► 数据流追踪 ──► 影响的内部信号 ──► 生成对应代码
-    │              │              │
-    │              ▼              ▼
-    │        分析 IR 中的      哪些 drv 依赖
-    │        use-def 链       该输入信号
-    ▼
-gpio_ext_porta → int_level, gpio_int_status, ...
-```
-
-**与 Issue #8 的关系**: Signal Tracing 需要从输入信号开始追踪依赖链，这是实现 `update_state()` 组合逻辑生成的前提。
-
-**相关代码**: [ClkAnalysisResult.cpp:427-510](src/lib/ClkAnalysisResult.cpp#L427-L510)
+**相关代码**: [SignalTracing.h:1214-1650](src/lib/SignalTracing.h#L1214-L1650)
 
 ## 输入信号处理架构
 
@@ -456,9 +538,9 @@ static void gpio_top_update_state(gpio_top_state *s)
 
 工具分析每个 `llhd.drv` 操作，将信号分为 4 类：
 
-### 1. CLK_IGNORABLE（事件驱动型）
+### 1. STATE_UNCHANGED（状态不变型）
 
-不依赖自身的信号，可转换为简单的寄存器写入。
+不依赖自身的信号，或 hold 模式（`reg = prb reg`），可转换为简单的寄存器写入。
 
 ```verilog
 // 示例：简单赋值
@@ -471,7 +553,7 @@ always @(posedge clk)
 s->reg_a = s->data_in;
 ```
 
-### 2. CLK_ACCUMULATE（计数器型）
+### 2. STATE_ACCUMULATE（状态累加型）
 
 具有 `signal = signal +/- constant` 形式的自依赖信号。
 
@@ -487,7 +569,7 @@ ptimer_state *counter_ptimer;
 // 使用 ptimer_get_count() / ptimer_set_count()
 ```
 
-### 3. CLK_LOOP_ITER（循环迭代器）
+### 3. STATE_LOOP_ITER（循环迭代器）
 
 组合逻辑中的 for 循环迭代变量。
 
@@ -499,11 +581,11 @@ for (i = 0; i < 32; i = i + 1)
 
 **QEMU 输出**：展开为位操作（目前跳过）
 
-### 4. CLK_COMPLEX（需手动处理）
+### 4. STATE_COMPLEX（需手动处理）
 
 表达式无法转换为 C 代码的信号。
 
-**判定为 CLK_COMPLEX 的条件**：
+**判定为 STATE_COMPLEX 的条件**：
 - 不是常量赋值
 - 不是简单信号赋值
 - 不是比较结果赋值
@@ -519,7 +601,7 @@ for (i = 0; i < 32; i = i + 1)
 ```
 对每个 drv 操作：
   1. 尝试生成 C 表达式 (tryGenerateAction)
-  2. 如果生成失败 -> CLK_COMPLEX
+  2. 如果生成失败 -> STATE_COMPLEX
   3. 如果生成成功 -> 根据模式分类
 ```
 
@@ -619,30 +701,52 @@ qemu-output/
          │ dff-opt --gen-qemu
          ▼
 ┌─────────────────────────────────────────┐
-│            信号分类阶段                   │
+│         信号类型分析阶段                  │
+│  ┌─────────────────────────────────┐    │
+│  │ 方案2: 使用模式识别               │    │
+│  │ - isInternalSignalByUsagePattern │    │
+│  │ - isClockSignalByUsagePattern    │    │
+│  └─────────────────────────────────┘    │
+│                 ▼                        │
+│  ┌─────────────────────────────────┐    │
+│  │ 方案3: 数据流分析                 │    │
+│  │ - isGPIOInputByDataFlow          │    │
+│  │ - isWriteEnableByDataFlow        │    │
+│  └─────────────────────────────────┘    │
+│                 ▼                        │
+│  ┌─────────────────────────────────┐    │
+│  │ 触发效果分析                      │    │
+│  │ - isClockByTriggerEffect         │    │
+│  │ - 区分时钟 vs 复位信号            │    │
+│  └─────────────────────────────────┘    │
+└────────────────┬────────────────────────┘
+                 │
+                 ▼
+┌─────────────────────────────────────────┐
+│            drv 分类阶段                   │
 │  ┌─────────────────────────────────┐    │
 │  │ tryGenerateAction()             │    │
 │  │ - 尝试生成 C 表达式              │    │
 │  │ - 使用 CombTranslator 翻译      │    │
 │  │ - 成功 → 继续分类                │    │
-│  │ - 失败 → CLK_COMPLEX            │    │
+│  │ - 失败 → STATE_COMPLEX          │    │
 │  └─────────────────────────────────┘    │
 │                 ▼                        │
 │  ┌─────────────────────────────────┐    │
 │  │ 模式匹配分类                     │    │
-│  │ - 不依赖自己 → CLK_IGNORABLE    │    │
-│  │ - sig+const → CLK_ACCUMULATE    │    │
-│  │ - for 循环 → CLK_LOOP_ITER      │    │
+│  │ - hold/不依赖自己 → STATE_UNCHANGED │
+│  │ - sig+const → STATE_ACCUMULATE  │    │
+│  │ - for 循环 → STATE_LOOP_ITER    │    │
 │  └─────────────────────────────────┘    │
 └────────────────┬────────────────────────┘
                  │
                  ▼
 ┌─────────────────────────────────────────┐
 │            代码生成阶段                   │
-│  - CLK_IGNORABLE → 简单寄存器           │
-│  - CLK_ACCUMULATE → ptimer 计数器       │
+│  - STATE_UNCHANGED → 简单寄存器         │
+│  - STATE_ACCUMULATE → ptimer 计数器     │
 │  - COMPUTE → CombTranslator 表达式      │
-│  - CLK_COMPLEX → 跳过（需手动）          │
+│  - STATE_COMPLEX → 跳过（需手动）        │
 └────────────────┬────────────────────────┘
                  │
                  ▼
