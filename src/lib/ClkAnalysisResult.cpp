@@ -466,7 +466,7 @@ ModuleAnalysisResult analyzeModule(mlir::ModuleOp mod) {
         auto it = signalMap.find(sigName);
         if (it != signalMap.end()) {
           // 已经是 ACCUMULATE，不需要更新
-          if (it->second.classification == DrvClassification::CLK_ACCUMULATE) {
+          if (it->second.classification == DrvClassification::STATE_ACCUMULATE) {
             // 但仍然尝试生成动作并保存
             EventAction action = tryGenerateAction(drv);
             it->second.preGeneratedActions.push_back(action);
@@ -490,12 +490,12 @@ ModuleAnalysisResult analyzeModule(mlir::ModuleOp mod) {
 
         // 如果表达式无法生成，直接标记为 COMPLEX
         if (isComplexAction(action)) {
-          sigResult.classification = DrvClassification::CLK_COMPLEX;
+          sigResult.classification = DrvClassification::STATE_COMPLEX;
           sigResult.hasComplexExpression = true;
           // 更新或插入
           if (it != signalMap.end()) {
             // 已有记录，发现复杂表达式，必须更新分类为 COMPLEX
-            it->second.classification = DrvClassification::CLK_COMPLEX;
+            it->second.classification = DrvClassification::STATE_COMPLEX;
             it->second.hasComplexExpression = true;
             it->second.preGeneratedActions.push_back(action);
           } else {
@@ -509,21 +509,21 @@ ModuleAnalysisResult analyzeModule(mlir::ModuleOp mod) {
         bool dependsOnSelf = checkDependsOnSignal(value, signal);
 
         if (!dependsOnSelf) {
-          sigResult.classification = DrvClassification::CLK_IGNORABLE;
+          sigResult.classification = DrvClassification::STATE_UNCHANGED;
         } else {
           // 检查 add 模式
           if (auto addOp = value.getDefiningOp<comb::AddOp>()) {
             int step = getAccumulateStep(addOp, signal);
             if (step != 0) {
               if (!isLoopIterator(drv, waitBlocks)) {
-                sigResult.classification = DrvClassification::CLK_ACCUMULATE;
+                sigResult.classification = DrvClassification::STATE_ACCUMULATE;
                 sigResult.direction = AccumulateDirection::UP;
                 sigResult.stepValue = step;
               } else {
-                sigResult.classification = DrvClassification::CLK_LOOP_ITER;
+                sigResult.classification = DrvClassification::STATE_LOOP_ITER;
               }
             } else {
-              sigResult.classification = DrvClassification::CLK_COMPLEX;
+              sigResult.classification = DrvClassification::STATE_COMPLEX;
             }
           }
           // 检查 sub 模式
@@ -531,33 +531,33 @@ ModuleAnalysisResult analyzeModule(mlir::ModuleOp mod) {
             int step = getSubtractStep(subOp, signal);
             if (step != 0) {
               if (!isLoopIterator(drv, waitBlocks)) {
-                sigResult.classification = DrvClassification::CLK_ACCUMULATE;
+                sigResult.classification = DrvClassification::STATE_ACCUMULATE;
                 sigResult.direction = AccumulateDirection::DOWN;
                 sigResult.stepValue = step;
               } else {
-                sigResult.classification = DrvClassification::CLK_LOOP_ITER;
+                sigResult.classification = DrvClassification::STATE_LOOP_ITER;
               }
             } else {
-              sigResult.classification = DrvClassification::CLK_COMPLEX;
+              sigResult.classification = DrvClassification::STATE_COMPLEX;
             }
           }
           // 检查 hold 模式
           else if (auto prb = value.getDefiningOp<llhd::PrbOp>()) {
             if (prb.getSignal() == signal) {
-              sigResult.classification = DrvClassification::CLK_IGNORABLE;
+              sigResult.classification = DrvClassification::STATE_UNCHANGED;
             } else {
-              sigResult.classification = DrvClassification::CLK_COMPLEX;
+              sigResult.classification = DrvClassification::STATE_COMPLEX;
             }
           }
           else {
-            sigResult.classification = DrvClassification::CLK_COMPLEX;
+            sigResult.classification = DrvClassification::STATE_COMPLEX;
           }
         }
 
         // 更新或插入
         // ACCUMULATE 优先级最高
         if (it != signalMap.end()) {
-          if (sigResult.classification == DrvClassification::CLK_ACCUMULATE) {
+          if (sigResult.classification == DrvClassification::STATE_ACCUMULATE) {
             it->second = sigResult;
           } else {
             // 保留原分类，但合并预生成动作
@@ -604,11 +604,11 @@ ModuleAnalysisResult analyzeModule(mlir::ModuleOp mod) {
       sigResult.preGeneratedActions.push_back(action);
 
       if (isComplexAction(action)) {
-        sigResult.classification = DrvClassification::CLK_COMPLEX;
+        sigResult.classification = DrvClassification::STATE_COMPLEX;
         sigResult.hasComplexExpression = true;
       } else {
         // 组合逻辑通常是 IGNORABLE
-        sigResult.classification = DrvClassification::CLK_IGNORABLE;
+        sigResult.classification = DrvClassification::STATE_UNCHANGED;
       }
 
       signalMap[sigName] = sigResult;
@@ -629,51 +629,256 @@ ModuleAnalysisResult analyzeModule(mlir::ModuleOp mod) {
 
 namespace {
 
-/// 检查信号名是否是时钟信号
-bool isClockSignal(const std::string &name) {
-  // 精确匹配
-  if (name == "clk" || name == "clock")
+/// 检查信号是否是时钟信号（基于使用模式 + 触发效果分析，模块级别）
+/// 遍历模块内所有 process，检查信号是否被用作时钟
+///
+/// 时钟信号的判断标准：
+/// 1. 基本结构特征：单比特，在敏感列表中，只有端口连接（无逻辑驱动）
+/// 2. 触发效果特征：触发的所有 drv 操作都是 hold 模式（保持原值）
+///
+/// 复位信号虽然满足结构特征，但触发的 drv 有状态修改（如 counter = 0）
+bool isClockSignalByUsageInModule(mlir::Value signal, hw::HWModuleOp hwMod) {
+  if (!signal || !hwMod)
+    return false;
+
+  bool isClockInAnyProcess = false;
+
+  hwMod.walk([&](llhd::ProcessOp processOp) {
+    // 第一步：检查基本结构特征
+    if (!signal_tracing::isClockSignalByUsagePattern(signal, processOp)) {
+      return mlir::WalkResult::advance();
+    }
+
+    // 第二步：检查触发效果（区分时钟和复位）
+    // 时钟：所有触发的 drv 都是 hold 模式
+    // 复位：触发的 drv 有状态修改
+    if (signal_tracing::isClockByTriggerEffect(signal, processOp)) {
+      isClockInAnyProcess = true;
+      return mlir::WalkResult::interrupt();
+    }
+
+    // 不满足触发效果条件，可能是复位信号，继续检查其他 process
+    return mlir::WalkResult::advance();
+  });
+
+  return isClockInAnyProcess;
+}
+
+/// 检查信号是否对应 APB 可读寄存器（跨模块检查，纯数据流分析）
+/// APB 只读寄存器的特征：
+/// 信号值被用于 prdata 的驱动（通过追踪 mux 和组合逻辑依赖）
+bool isAPBReadableRegisterByName(const std::string &signalName, mlir::ModuleOp topModule) {
+  if (!topModule)
+    return false;
+
+  bool hasAPBReadPath = false;
+
+  // 深度追踪：检查 prdata 的所有驱动源
+  topModule.walk([&](hw::HWModuleOp hwMod) {
+    // 查找 prdata 信号
+    llhd::SignalOp prdataSignal = nullptr;
+    hwMod.walk([&](llhd::SignalOp sigOp) {
+      if (auto nameAttr = sigOp->getAttrOfType<StringAttr>("name")) {
+        if (nameAttr.getValue() == "prdata") {
+          prdataSignal = sigOp;
+          return mlir::WalkResult::interrupt();
+        }
+      }
+      return mlir::WalkResult::advance();
+    });
+
+    if (!prdataSignal)
+      return mlir::WalkResult::advance();
+
+    // 收集所有驱动 prdata 的来源
+    // 使用深度优先搜索追踪所有 mux 和组合逻辑
+    llvm::SmallPtrSet<mlir::Operation*, 32> visited;
+    llvm::SmallVector<mlir::Value, 16> worklist;
+
+    hwMod.walk([&](llhd::DrvOp drvOp) {
+      if (drvOp.getSignal() == prdataSignal.getResult()) {
+        worklist.push_back(drvOp.getValue());
+      }
+    });
+
+    while (!worklist.empty()) {
+      mlir::Value current = worklist.pop_back_val();
+      mlir::Operation *defOp = current.getDefiningOp();
+
+      if (!defOp || !visited.insert(defOp).second)
+        continue;
+
+      // 检查是否是 prb 操作（读取信号）
+      if (auto prbOp = mlir::dyn_cast<llhd::PrbOp>(defOp)) {
+        mlir::Value sig = prbOp.getSignal();
+        if (auto sigOp = sig.getDefiningOp<llhd::SignalOp>()) {
+          if (auto nameAttr = sigOp->getAttrOfType<StringAttr>("name")) {
+            if (nameAttr.getValue() == signalName) {
+              hasAPBReadPath = true;
+              return mlir::WalkResult::interrupt();
+            }
+          }
+        }
+        continue;
+      }
+
+      // 追踪 mux 的所有输入
+      if (auto muxOp = mlir::dyn_cast<comb::MuxOp>(defOp)) {
+        worklist.push_back(muxOp.getTrueValue());
+        worklist.push_back(muxOp.getFalseValue());
+        continue;
+      }
+
+      // 追踪其他组合逻辑的操作数
+      for (mlir::Value operand : defOp->getOperands()) {
+        worklist.push_back(operand);
+      }
+    }
+
+    if (hasAPBReadPath)
+      return mlir::WalkResult::interrupt();
+
+    return mlir::WalkResult::advance();
+  });
+
+  return hasAPBReadPath;
+}
+
+// 前向声明
+bool isAPBWritableRegisterByName(const std::string &signalName, mlir::ModuleOp topModule);
+
+/// 检查信号名是否对应 APB 寄存器（可读或可写）
+bool isAPBRegisterByName(const std::string &signalName, mlir::ModuleOp topModule) {
+  return isAPBWritableRegisterByName(signalName, topModule) ||
+         isAPBReadableRegisterByName(signalName, topModule);
+}
+
+/// 检查信号名是否对应 APB 可写寄存器（跨模块检查）
+/// APB 寄存器即使结构上像时钟，也不应该被当作时钟过滤
+/// 这个函数检查是否有任何模块中存在同名的 APB 可写信号
+bool isAPBWritableRegisterByName(const std::string &signalName, mlir::ModuleOp topModule) {
+  if (!topModule)
+    return false;
+
+  bool hasAPBWritePath = false;
+
+  // 遍历所有 hw.module
+  topModule.walk([&](hw::HWModuleOp hwMod) {
+    // 查找同名信号
+    hwMod.walk([&](llhd::SignalOp sigOp) {
+      std::string sigName;
+      if (auto nameAttr = sigOp->getAttrOfType<StringAttr>("name")) {
+        sigName = nameAttr.getValue().str();
+      }
+
+      if (sigName != signalName)
+        return mlir::WalkResult::advance();
+
+      mlir::Value signal = sigOp.getResult();
+
+      // 检查此信号是否有 APB 写路径
+      hwMod.walk([&](llhd::DrvOp drvOp) {
+        if (drvOp.getSignal() != signal)
+          return mlir::WalkResult::advance();
+
+        mlir::Value drvValue = drvOp.getValue();
+
+        // APB 写特征：drv 在条件分支内，且驱动值不是常量
+        mlir::Block *block = drvOp->getBlock();
+        if (block && !block->isEntryBlock()) {
+          if (!drvValue.getDefiningOp<hw::ConstantOp>()) {
+            hasAPBWritePath = true;
+            return mlir::WalkResult::interrupt();
+          }
+        }
+
+        return mlir::WalkResult::advance();
+      });
+
+      if (hasAPBWritePath)
+        return mlir::WalkResult::interrupt();
+
+      return mlir::WalkResult::advance();
+    });
+
+    if (hasAPBWritePath)
+      return mlir::WalkResult::interrupt();
+
+    return mlir::WalkResult::advance();
+  });
+
+  return hasAPBWritePath;
+}
+
+/// 检查信号是否是时钟信号（纯功能检测，方案2）
+/// 时钟信号的特征：
+/// 1. 单比特信号 (i1)
+/// 2. 在 wait 敏感列表中被观察
+/// 3. 只有输入端口连接的 drv，没有逻辑驱动
+/// 4. 不是 APB 可写寄存器
+bool isClockSignal(const std::string &name,
+                   mlir::Value signal,
+                   hw::HWModuleOp hwMod,
+                   mlir::ModuleOp topModule) {
+  // 必须有 signal 和 hwMod 才能进行功能检测
+  if (!signal || !hwMod)
+    return false;
+
+  // 方案2：基于使用模式识别
+  if (isClockSignalByUsageInModule(signal, hwMod)) {
+    // 额外检查：如果信号是 APB 可写寄存器，则不是时钟
+    // APB 寄存器（如 gpio_int_level_sync）虽然结构上像时钟，但应该作为寄存器处理
+    if (topModule && isAPBWritableRegisterByName(name, topModule)) {
+      return false;  // 是寄存器，不是时钟
+    }
     return true;
-  // 前缀匹配
-  if (name.find("pclk") == 0 || name.find("dbclk") == 0 ||
-      name.find("hclk") == 0 || name.find("aclk") == 0 ||
-      name.find("sclk") == 0 || name.find("fclk") == 0)
-    return true;
-  // 后缀匹配
-  if (name.size() > 4 && name.substr(name.size() - 4) == "_clk")
-    return true;
-  if (name.size() > 5 && name.substr(name.size() - 5) == "_pclk")
-    return true;
+  }
+
   return false;
 }
 
 /// 检查信号名是否是 APB 协议信号
 bool isAPBProtocolSignal(const std::string &name) {
+  // 方案1: 基于拓扑角色分析
+  // APB 协议信号的特征：
+  // 1. 通常是模块输入 (psel, penable, pwrite, paddr, pwdata 是输入)
+  // 2. prdata 是模块输出（有 drv 写入，没有 prb 读取）
+  // 3. psel, penable, pwrite 组合用于 AND 操作（控制流）
+  // 4. paddr 用于 icmp 地址比较（地址选择器）
+  // 5. pwdata 用于 drv 的数据源（数据传输）
+  // TODO: 需要传入 mlir::Value 才能进行角色分析
+  // 临时方案：先使用名字检测，后续改造 API
+
+  // 向后兼容：名字检测（临时保留）
   return name == "psel" || name == "penable" || name == "pwrite" ||
          name == "paddr" || name == "pwdata" || name == "prdata" ||
          name == "pready" || name == "pslverr";
 }
 
-/// 检查信号名是否是 GPIO 外部输入信号
-/// 只匹配真正的外部端口输入，不匹配 gpio_int_xxx 等控制寄存器
-bool isGPIOInputSignal(const std::string &name) {
-  // gpio_ext_porta, gpio_ext_portb, etc. - 外部端口数据
-  if (name.find("gpio_ext_port") != std::string::npos)
+/// 检查信号是否是 GPIO 外部输入信号（纯数据流分析，方案3）
+/// GPIO 外部输入信号的特征：
+/// 1. 是模块输入端口（通过 drv 从 BlockArgument 连接）
+/// 2. 数据流向: port → prb → 组合逻辑 → drv 内部寄存器
+/// 3. 不参与地址选择（不用于 icmp）
+/// 4. 不参与控制流（不用于 and/or 形成条件）
+/// 5. 不是 APB 寄存器（APB 寄存器通过 MMIO 访问）
+bool isGPIOInputSignal(const std::string &name,
+                       mlir::Value signal,
+                       hw::HWModuleOp hwMod,
+                       mlir::ModuleOp topModule) {
+  // 必须有 signal 和 hwMod 才能进行功能检测
+  if (!signal || !hwMod)
+    return false;
+
+  // 方案3：基于数据流分析
+  if (signal_tracing::isGPIOInputByDataFlow(signal, hwMod)) {
+    // 排除 APB 寄存器：APB 寄存器虽然数据流特征类似，但应该通过 MMIO 访问
+    if (topModule && isAPBRegisterByName(name, topModule)) {
+      return false;  // 是 APB 寄存器，不是 GPIO 输入
+    }
     return true;
-  // gpio_ext_data - 外部数据
-  if (name == "gpio_ext_data")
-    return true;
-  // gpio_in_data - 外部输入数据（注意：不要匹配 gpio_int_xxx）
-  if (name == "gpio_in_data")
-    return true;
-  // 其他 _porta, _portb 等后缀（但不包含 gpio_int）
-  if (name.find("gpio_int") == std::string::npos) {
-    if (name.find("_porta") != std::string::npos ||
-        name.find("_portb") != std::string::npos ||
-        name.find("_portc") != std::string::npos ||
-        name.find("_portd") != std::string::npos)
-      return true;
   }
+
   return false;
 }
 
@@ -685,26 +890,62 @@ bool isGPIOInputSignal(const std::string &name) {
 ///   "apb" - APB 协议信号（MMIO 处理）
 ///   "gpio_in" - GPIO 外部输入（qdev_init_gpio_in）
 void collectInputPorts(hw::HWModuleOp hwMod,
-                       std::map<std::string, std::string> &inputs) {
+                       std::map<std::string, std::string> &inputs,
+                       mlir::ModuleOp topModule) {
+  // 方案2：收集信号名到 mlir::Value 的映射，用于功能检测
+  // 从所有模块收集信号（因为输入端口可能在子模块中定义）
+  llvm::StringMap<mlir::Value> signalMap;
+  llvm::StringMap<hw::HWModuleOp> signalModuleMap;
+
+  if (topModule) {
+    topModule.walk([&](hw::HWModuleOp mod) {
+      mod.walk([&](llhd::SignalOp sigOp) {
+        if (auto nameAttr = sigOp->getAttrOfType<StringAttr>("name")) {
+          signalMap[nameAttr.getValue()] = sigOp.getResult();
+          signalModuleMap[nameAttr.getValue()] = mod;
+        }
+      });
+    });
+  } else {
+    hwMod.walk([&](llhd::SignalOp sigOp) {
+      if (auto nameAttr = sigOp->getAttrOfType<StringAttr>("name")) {
+        signalMap[nameAttr.getValue()] = sigOp.getResult();
+        signalModuleMap[nameAttr.getValue()] = hwMod;
+      }
+    });
+  }
+
   auto moduleType = hwMod.getHWModuleType();
   for (auto port : moduleType.getPorts()) {
     if (port.dir == hw::ModulePort::Direction::Input) {
       std::string name = port.name.str();
 
-      // 1. 过滤时钟信号
-      if (isClockSignal(name)) {
-        inputs[name] = "clock";  // 标记但不参与事件处理
-        continue;
+      // 查找对应的信号 Value 和所在模块（用于功能检测）
+      mlir::Value signal = nullptr;
+      hw::HWModuleOp signalMod = hwMod;
+      auto it = signalMap.find(name);
+      if (it != signalMap.end()) {
+        signal = it->second;
+        auto modIt = signalModuleMap.find(name);
+        if (modIt != signalModuleMap.end()) {
+          signalMod = modIt->second;
+        }
       }
 
-      // 2. 标记 APB 协议信号
+      // 1. 标记 APB 协议信号（优先级最高，避免被误识别为时钟）
       if (isAPBProtocolSignal(name)) {
         inputs[name] = "apb";  // 通过 MMIO 处理
         continue;
       }
 
-      // 3. 标记 GPIO 外部输入
-      if (isGPIOInputSignal(name)) {
+      // 2. 过滤时钟信号（功能检测 + 跨模块 APB 寄存器检查）
+      if (isClockSignal(name, signal, signalMod, topModule)) {
+        inputs[name] = "clock";  // 标记但不参与事件处理
+        continue;
+      }
+
+      // 3. 标记 GPIO 外部输入（数据流分析 + APB 寄存器排除）
+      if (isGPIOInputSignal(name, signal, signalMod, topModule)) {
         inputs[name] = "gpio_in";  // 通过 qdev_init_gpio_in 处理
         continue;
       }
@@ -972,7 +1213,7 @@ void detectControlRelations(const std::vector<EventHandler> &handlers,
   // 收集所有 ACCUMULATE 类型的信号名
   llvm::StringSet<> counterSignals;
   for (const auto &sig : signals) {
-    if (sig.classification == DrvClassification::CLK_ACCUMULATE) {
+    if (sig.classification == DrvClassification::STATE_ACCUMULATE) {
       counterSignals.insert(sig.name);
     }
   }
@@ -1092,15 +1333,15 @@ ModuleAnalysisResult analyzeModuleWithEvents(mlir::ModuleOp mod) {
 
   // 收集输入信号和事件处理逻辑
   mod.walk([&](hw::HWModuleOp hwMod) {
-    // 收集输入端口
-    collectInputPorts(hwMod, result.inputSignals);
+    // 收集输入端口（传入顶层模块用于跨模块 APB 寄存器检查）
+    collectInputPorts(hwMod, result.inputSignals, mod);
 
     // 为信号设置角色
     for (auto &sig : result.signals) {
       // 根据依赖关系和分类设置角色
       if (result.inputSignals.find(sig.name) != result.inputSignals.end()) {
         sig.role = SignalRole::INPUT;
-      } else if (sig.classification == DrvClassification::CLK_ACCUMULATE) {
+      } else if (sig.classification == DrvClassification::STATE_ACCUMULATE) {
         sig.role = SignalRole::STATE;
       } else {
         // 检查是否有其他信号依赖此信号
@@ -1143,6 +1384,14 @@ void extractAPBRegisterMappings(ModuleOp mod,
   // 遍历所有模块
   mod.walk([&](hw::HWModuleOp hwMod) {
     unsigned andCount = 0, apbAndCount = 0, extractedCount = 0;
+
+    // 方案2：收集所有信号名到 mlir::Value 的映射，用于后续的使用模式分析
+    llvm::StringMap<mlir::Value> signalMap;
+    hwMod.walk([&](llhd::SignalOp sigOp) {
+      if (auto nameAttr = sigOp->getAttrOfType<StringAttr>("name")) {
+        signalMap[nameAttr.getValue()] = sigOp.getResult();
+      }
+    });
 
     // 遍历所有 AND 操作
     hwMod.walk([&](comb::AndOp andOp) {
@@ -1468,48 +1717,65 @@ void extractAPBRegisterMappings(ModuleOp mod,
                  << " prdata drives, extracted " << readExtractedCount << " read-only mappings\n";
   });
 
-  // 过滤内部信号（非真实寄存器）
-  auto isInternalSignal = [](const std::string &name) -> bool {
-    // 过滤 ri_* 前缀（寄存器输入镜像）
-    if (name.find("ri_") == 0)
-      return true;
+  // 方案2：基于使用模式过滤内部信号（不依赖名字）
+  // 收集所有模块的信号映射（用于跨模块分析）
+  llvm::StringMap<mlir::Value> allSignals;
+  hw::HWModuleOp targetHwMod = nullptr;
+  mod.walk([&](hw::HWModuleOp hwMod) {
+    if (!targetHwMod) targetHwMod = hwMod;
+    hwMod.walk([&](llhd::SignalOp sigOp) {
+      if (auto nameAttr = sigOp->getAttrOfType<StringAttr>("name")) {
+        allSignals[nameAttr.getValue()] = sigOp.getResult();
+      }
+    });
+  });
 
-    // 过滤 *_wen 后缀（写使能）
-    if (name.find("_wen") != std::string::npos)
-      return true;
+  // 过滤内部信号
+  auto isInternalSignal = [&](const std::string &name) -> bool {
+    auto it = allSignals.find(name);
+    if (it != allSignals.end() && targetHwMod) {
+      mlir::Value signal = it->second;
 
-    // 过滤 *_tmp 后缀（临时变量）
-    if (name.find("_tmp") != std::string::npos)
-      return true;
+      // 方案1：基于拓扑角色分析
+      signal_tracing::SignalRole role = signal_tracing::analyzeSignalRole(signal);
+      if (role == signal_tracing::SignalRole::InternalIntermediate) {
+        // 内部中间值（有 drv 写入，也有 prb 读取，用于中间计算）
+        return true;
+      }
+      if (role == signal_tracing::SignalRole::ControlFlow) {
+        // 控制流信号（只用于条件分支）
+        return true;
+      }
 
-    // 过滤 PROCESS 内部信号
-    if (name.find("PROC") != std::string::npos || name.find("_ff") != std::string::npos)
-      return true;
+      // 方案2：基于使用模式识别（结构特征）
+      // 内部信号特征：只在一个 process 内使用，且只有一个写入点
+      if (signal_tracing::isInternalSignalByUsagePattern(signal, targetHwMod)) {
+        return true;
+      }
+    }
 
-    // 过滤 APB 协议信号本身（不应该作为寄存器）
+    // APB 协议信号本身（不应该作为寄存器）
+    // 这些是模块输入，用于地址/控制/数据传输
     if (name == "paddr" || name == "pwdata" || name == "prdata" ||
         name == "psel" || name == "penable" || name == "pwrite")
-      return true;
-
-    // 过滤时钟和复位信号
-    if (name.find("pclk") != std::string::npos || name == "presetn")
-      return true;
-
-    // 过滤内部逻辑信号（常见模式）
-    if (name.find("int_edge") != std::string::npos ||
-        name.find("int_level_ff") != std::string::npos ||
-        name.find("int_clk_en") != std::string::npos ||
-        name.find("zero_value") != std::string::npos)
       return true;
 
     return false;
   };
 
   // 应用过滤
+  // 注意：只过滤可写寄存器中的内部信号
+  // 只读寄存器（如状态寄存器）即使被内部逻辑写入，也是合法的APB可读寄存器
   size_t beforeFilter = mappings.size();
   mappings.erase(
     std::remove_if(mappings.begin(), mappings.end(),
-      [&](const APBRegisterMapping &m) { return isInternalSignal(m.registerName); }),
+      [&](const APBRegisterMapping &m) {
+        // 只读寄存器不过滤（它们是硬件状态寄存器，通过APB可读）
+        if (m.isReadable && !m.isWritable) {
+          return false;
+        }
+        return isInternalSignal(m.registerName);
+      }),
     mappings.end()
   );
 

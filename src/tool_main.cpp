@@ -155,19 +155,19 @@ int main(int argc, char **argv) {
     for (const auto &sig : analysisResult.signals) {
       llvm::outs() << "  - " << sig.name << " (i" << sig.bitWidth << "): ";
       switch (sig.classification) {
-        case clk_analysis::DrvClassification::CLK_IGNORABLE:
-          llvm::outs() << "CLK_IGNORABLE -> SimpleReg\n";
+        case clk_analysis::DrvClassification::STATE_UNCHANGED:
+          llvm::outs() << "STATE_UNCHANGED -> SimpleReg\n";
           break;
-        case clk_analysis::DrvClassification::CLK_ACCUMULATE:
-          llvm::outs() << "CLK_ACCUMULATE -> ICountCounter (";
+        case clk_analysis::DrvClassification::STATE_ACCUMULATE:
+          llvm::outs() << "STATE_ACCUMULATE -> ICountCounter (";
           llvm::outs() << (sig.direction == clk_analysis::AccumulateDirection::UP ? "+" : "-");
           llvm::outs() << sig.stepValue << ")\n";
           break;
-        case clk_analysis::DrvClassification::CLK_LOOP_ITER:
-          llvm::outs() << "CLK_LOOP_ITER -> skip (combinational)\n";
+        case clk_analysis::DrvClassification::STATE_LOOP_ITER:
+          llvm::outs() << "STATE_LOOP_ITER -> skip (combinational)\n";
           break;
-        case clk_analysis::DrvClassification::CLK_COMPLEX:
-          llvm::outs() << "CLK_COMPLEX -> skip (needs manual handling)\n";
+        case clk_analysis::DrvClassification::STATE_COMPLEX:
+          llvm::outs() << "STATE_COMPLEX -> skip (needs manual handling)\n";
           break;
       }
     }
@@ -223,18 +223,18 @@ int main(int argc, char **argv) {
     // 根据分析结果添加信号
     for (const auto &sig : analysisResult.signals) {
       switch (sig.classification) {
-        case clk_analysis::DrvClassification::CLK_IGNORABLE:
+        case clk_analysis::DrvClassification::STATE_UNCHANGED:
           gen.addSimpleReg(sig.name, sig.bitWidth);
           break;
-        case clk_analysis::DrvClassification::CLK_ACCUMULATE: {
+        case clk_analysis::DrvClassification::STATE_ACCUMULATE: {
           auto dir = (sig.direction == clk_analysis::AccumulateDirection::UP)
                          ? qemu_codegen::CounterDirection::UP
                          : qemu_codegen::CounterDirection::DOWN;
           gen.addICountCounter(sig.name, sig.bitWidth, dir, sig.stepValue);
           break;
         }
-        case clk_analysis::DrvClassification::CLK_LOOP_ITER:
-        case clk_analysis::DrvClassification::CLK_COMPLEX:
+        case clk_analysis::DrvClassification::STATE_LOOP_ITER:
+        case clk_analysis::DrvClassification::STATE_COMPLEX:
           // 跳过这些，需要手动处理
           break;
       }

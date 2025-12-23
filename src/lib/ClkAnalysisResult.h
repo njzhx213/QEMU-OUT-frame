@@ -10,12 +10,12 @@
 
 namespace clk_analysis {
 
-/// 寄存器写操作的分类
+/// 寄存器写操作的分类（基于状态变化）
 enum class DrvClassification {
-  CLK_IGNORABLE,   // 可忽略时钟，转换为事件驱动
-  CLK_ACCUMULATE,  // 累计型，需要 icount/ptimer
-  CLK_LOOP_ITER,   // for 循环迭代器，组合逻辑
-  CLK_COMPLEX,     // 复杂依赖，需要进一步分析
+  STATE_UNCHANGED,   // 状态不变（hold 或不依赖自身），可过滤
+  STATE_ACCUMULATE,  // 状态累加/累减，需要 icount/ptimer
+  STATE_LOOP_ITER,   // 循环迭代器，组合逻辑
+  STATE_COMPLEX,     // 复杂状态变化，需要进一步分析
 };
 
 /// 累积操作的方向
@@ -110,7 +110,7 @@ struct SignalAnalysisResult {
   bool hasComplexExpression;     // 是否有无法生成的复杂表达式
 
   SignalAnalysisResult()
-      : name(""), bitWidth(32), classification(DrvClassification::CLK_IGNORABLE),
+      : name(""), bitWidth(32), classification(DrvClassification::STATE_UNCHANGED),
         direction(AccumulateDirection::NONE), stepValue(0),
         role(SignalRole::INTERNAL), hasComplexExpression(false) {}
 };

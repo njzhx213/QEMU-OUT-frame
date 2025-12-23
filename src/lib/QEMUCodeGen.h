@@ -136,6 +136,9 @@ private:
                                 llvm::StringRef counterName,
                                 bool start, int indentLevel);
 
+  /// 检查信号是否是内部信号（非寄存器）
+  bool isInternalSignal(llvm::StringRef name) const;
+
   /// 生成派生信号的 getter 函数
   void generateDerivedSignalGetters(llvm::raw_ostream &os);
 

@@ -742,41 +742,21 @@ const clk_analysis::DerivedSignal* QEMUDeviceGenerator::getDerivedSignal(llvm::S
 }
 
 /// 检查信号是否是内部信号（非寄存器）
+/// 注意：此函数仅在后备模式（无 APB 映射）下使用
+/// 主要 APB 寄存器过滤已在分析阶段通过功能检测完成
 bool QEMUDeviceGenerator::isInternalSignal(llvm::StringRef name) const {
   std::string nameStr = name.str();
 
-  // 过滤 ri_* 前缀（寄存器输入镜像）
-  if (nameStr.find("ri_") == 0)
-    return true;
-
-  // 过滤 *_wen 后缀（写使能）
-  if (nameStr.find("_wen") != std::string::npos)
-    return true;
-
-  // 过滤 *_tmp 后缀（临时变量）
-  if (nameStr.find("_tmp") != std::string::npos)
-    return true;
-
-  // 过滤 PROCESS 内部信号
-  if (nameStr.find("PROC") != std::string::npos || nameStr.find("_ff") != std::string::npos)
-    return true;
-
-  // 过滤 APB 协议信号本身（不应该作为寄存器）
+  // 过滤 APB 协议信号本身（不应该作为数据寄存器暴露）
+  // 这些是总线控制/数据信号，不是设备状态寄存器
   if (nameStr == "paddr" || nameStr == "pwdata" || nameStr == "prdata" ||
-      nameStr == "psel" || nameStr == "penable" || nameStr == "pwrite")
+      nameStr == "psel" || nameStr == "penable" || nameStr == "pwrite" ||
+      nameStr == "pready" || nameStr == "pslverr")
     return true;
 
-  // 过滤时钟和复位信号
-  if (nameStr.find("pclk") != std::string::npos || nameStr == "presetn")
-    return true;
-
-  // 过滤内部逻辑信号（常见模式）
-  if (nameStr.find("int_edge") != std::string::npos ||
-      nameStr.find("int_level_ff") != std::string::npos ||
-      nameStr.find("int_clk_en") != std::string::npos ||
-      nameStr.find("zero_value") != std::string::npos ||
-      nameStr.find("int_k") != std::string::npos)
-    return true;
+  // 注意：其他内部信号（写使能、临时变量等）已在分析阶段
+  // 通过 signal_tracing::isInternalSignalByUsagePattern 和
+  // signal_tracing::isWriteEnableByDataFlow 进行功能检测
 
   return false;
 }

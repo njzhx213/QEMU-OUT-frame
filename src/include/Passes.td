@@ -14,9 +14,9 @@ def ClkDependencyAnalysis : Pass<"clk-dependency-analysis", "mlir::ModuleOp"> {
     signals and how they should be converted for QEMU device emulation.
 
     It classifies each register write (llhd.drv) into:
-    - CLK_IGNORABLE: Can be converted to event-driven (e.g., reset, load)
-    - CLK_ACCUMULATE: Needs icount/ptimer (e.g., counter++)
-    - CLK_LOOP_ITER: Is a for-loop iterator, not real clock accumulation
-    - CLK_COMPLEX: Complex dependency, needs further analysis
+    - STATE_UNCHANGED: State unchanged (hold or not self-dependent), can be filtered
+    - STATE_ACCUMULATE: Needs icount/ptimer (e.g., counter++)
+    - STATE_LOOP_ITER: Is a for-loop iterator, not real clock accumulation
+    - STATE_COMPLEX: Complex state change, needs further analysis
   }];
 }

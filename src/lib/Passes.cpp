@@ -49,12 +49,12 @@ struct DffDemoPass : public ::impl::DffDemoBase<DffDemoPass> {
 // ClkDependencyAnalysis Pass (新增)
 //===----------------------------------------------------------------------===//
 
-/// 寄存器写操作的分类
+/// 寄存器写操作的分类（基于状态变化）
 enum class DrvClassification {
-  CLK_IGNORABLE,   // 可忽略时钟，转换为事件驱动
-  CLK_ACCUMULATE,  // 累计型，需要 icount/ptimer
-  CLK_LOOP_ITER,   // for 循环迭代器，组合逻辑
-  CLK_COMPLEX,     // 复杂依赖，需要进一步分析
+  STATE_UNCHANGED,   // 状态不变（hold 或不依赖自身），可过滤
+  STATE_ACCUMULATE,  // 状态累加/累减，需要 icount/ptimer
+  STATE_LOOP_ITER,   // 循环迭代器，组合逻辑
+  STATE_COMPLEX,     // 复杂状态变化，需要进一步分析
 };
 
 /// COMPLEX 的细分类型（按优先级：Clock > Protocol > Data）
@@ -67,10 +67,10 @@ enum class ComplexSubType {
 
 llvm::StringRef classificationToString(DrvClassification c) {
   switch (c) {
-    case DrvClassification::CLK_IGNORABLE:  return "CLK_IGNORABLE";
-    case DrvClassification::CLK_ACCUMULATE: return "CLK_ACCUMULATE";
-    case DrvClassification::CLK_LOOP_ITER:  return "CLK_LOOP_ITER";
-    case DrvClassification::CLK_COMPLEX:    return "CLK_COMPLEX";
+    case DrvClassification::STATE_UNCHANGED:  return "STATE_UNCHANGED";
+    case DrvClassification::STATE_ACCUMULATE: return "STATE_ACCUMULATE";
+    case DrvClassification::STATE_LOOP_ITER:  return "STATE_LOOP_ITER";
+    case DrvClassification::STATE_COMPLEX:    return "STATE_COMPLEX";
   }
   return "UNKNOWN";
 }
@@ -128,10 +128,10 @@ struct ClkDependencyAnalysisPass
 
           // 统计
           switch (cls) {
-            case DrvClassification::CLK_IGNORABLE:  ++ignorable; break;
-            case DrvClassification::CLK_ACCUMULATE: ++accumulate; break;
-            case DrvClassification::CLK_LOOP_ITER:  ++loopIter; break;
-            case DrvClassification::CLK_COMPLEX:
+            case DrvClassification::STATE_UNCHANGED:  ++ignorable; break;
+            case DrvClassification::STATE_ACCUMULATE: ++accumulate; break;
+            case DrvClassification::STATE_LOOP_ITER:  ++loopIter; break;
+            case DrvClassification::STATE_COMPLEX:
               ++complex;
               // 细分统计
               switch (complexSub) {
@@ -152,13 +152,13 @@ struct ClkDependencyAnalysisPass
     llvm::outs() << "Summary:\n";
     llvm::outs() << "  Total processes: " << totalProcesses << "\n";
     llvm::outs() << "  Total drv ops:   " << totalDrvs << "\n";
-    llvm::outs() << "  - CLK_IGNORABLE:  " << ignorable
+    llvm::outs() << "  - STATE_UNCHANGED:  " << ignorable
                  << " (can be event-driven)\n";
-    llvm::outs() << "  - CLK_ACCUMULATE: " << accumulate
+    llvm::outs() << "  - STATE_ACCUMULATE: " << accumulate
                  << " (need icount/ptimer)\n";
-    llvm::outs() << "  - CLK_LOOP_ITER:  " << loopIter
+    llvm::outs() << "  - STATE_LOOP_ITER:  " << loopIter
                  << " (for-loop, combinational)\n";
-    llvm::outs() << "  - CLK_COMPLEX:    " << complex << "\n";
+    llvm::outs() << "  - STATE_COMPLEX:    " << complex << "\n";
     if (complex > 0) {
       llvm::outs() << "      * Clock related:  " << complexClockRelated
                    << " (need clock simulation)\n";
@@ -190,7 +190,7 @@ private:
     // ========== 统一方案: 先检查表达式是否可以生成 ==========
     auto action = clk_analysis::tryGenerateAction(drv);
     if (clk_analysis::isComplexAction(action)) {
-      // 表达式无法生成 → CLK_COMPLEX
+      // 表达式无法生成 → STATE_COMPLEX
       llvm::outs() << "(cannot generate: ";
       // 分析依赖信号
       auto deps = signal_tracing::getAllSignalDependencies(value);
@@ -208,7 +208,7 @@ private:
         complexSub = ComplexSubType::DATA_ONLY;
       }
       llvm::outs() << "complex) ";
-      return DrvClassification::CLK_COMPLEX;
+      return DrvClassification::STATE_COMPLEX;
     }
 
     // Step 1: 检查 value 是否依赖于 signal 自己
@@ -217,7 +217,7 @@ private:
     if (!dependsOnSelf) {
       // 不依赖自己 → 覆盖型，可忽略时钟
       llvm::outs() << "(overwrite) ";
-      return DrvClassification::CLK_IGNORABLE;
+      return DrvClassification::STATE_UNCHANGED;
     }
 
     // Step 2: 依赖自己，检查是什么模式
@@ -228,10 +228,10 @@ private:
         // Step 3: 检查是否是 for 循环迭代器
         if (isLoopIterator(drv, addOp, waitBlocks)) {
           llvm::outs() << "(for-loop iter) ";
-          return DrvClassification::CLK_LOOP_ITER;
+          return DrvClassification::STATE_LOOP_ITER;
         }
         llvm::outs() << "(accumulate: +const) ";
-        return DrvClassification::CLK_ACCUMULATE;
+        return DrvClassification::STATE_ACCUMULATE;
       }
     }
 
@@ -239,10 +239,10 @@ private:
       if (isSubtractPattern(subOp, signal)) {
         if (isLoopIterator(drv, subOp, waitBlocks)) {
           llvm::outs() << "(for-loop iter) ";
-          return DrvClassification::CLK_LOOP_ITER;
+          return DrvClassification::STATE_LOOP_ITER;
         }
         llvm::outs() << "(accumulate: -const) ";
-        return DrvClassification::CLK_ACCUMULATE;
+        return DrvClassification::STATE_ACCUMULATE;
       }
     }
 
@@ -250,7 +250,7 @@ private:
     if (auto prb = value.getDefiningOp<llhd::PrbOp>()) {
       if (prb.getSignal() == signal) {
         llvm::outs() << "(hold) ";
-        return DrvClassification::CLK_IGNORABLE;
+        return DrvClassification::STATE_UNCHANGED;
       }
     }
 
@@ -299,7 +299,7 @@ private:
     }
 
     llvm::outs() << ") ";
-    return DrvClassification::CLK_COMPLEX;
+    return DrvClassification::STATE_COMPLEX;
   }
 
   /// 检查 value 是否依赖于 signal

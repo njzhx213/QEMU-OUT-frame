@@ -23,64 +23,72 @@ typedef struct gpio_top_state {
     qemu_irq irq;
 
     uint32_t ri_gpio_raw_int_status;
+    uint8_t gpio_int_en_wen;
+    uint32_t gpio_int_clr;
+    uint32_t ri_gpio_sw_data;
+    uint8_t zero_value;
+    uint8_t gpio_int_clk_en;
+    uint32_t gpio_int_type;
+    uint32_t gpio_int_clr;
+    uint32_t SUPPORT_INT_LEVEL_SYNC_PROC_int_level_sync_in_ff2;
+    uint8_t gpio_int_clr_wen;
+    uint32_t ri_gpio_int_en;
+    uint32_t int_edge_out;
+    uint32_t gpio_sw_dir;
+    uint8_t gpio_int_clk_en_tmp;
+    uint8_t pclk_int;
+    uint32_t ri_gpio_sw_dir;
+    uint8_t gpio_int_flag_tmp;
+    uint32_t SUPPORT_INT_LEVEL_SYNC_PROC_int_level_sync_in_ff1;
+    uint32_t gpio_int_status_level;
+    uint32_t int_level;
+    uint32_t ri_gpio_int_mask;
+    uint32_t int_level_ff1;
+    uint32_t gpio_int_status;
+    uint8_t penable;
+    uint32_t gpio_rx_data_int;
+    uint32_t gpio_int_en;
+    uint8_t gpio_sw_data_wen;
+    uint32_t ri_gpio_int_status;
+    uint32_t int_level_sync_in;
+    uint8_t gpio_int_type_wen;
+    uint8_t gpio_sw_dir_wen;
+    uint32_t gpio_rx_data;
+    uint8_t presetn;
+    uint32_t gpio_ext_data;
     uint32_t gpio_raw_int_status;
     uint8_t gpio_int_level_sync;
     uint32_t ri_gpio_int_type;
-    uint8_t gpio_int_en_wen;
-    uint32_t ri_gpio_sw_data;
     uint32_t gpio_int_pol;
-    uint8_t gpio_int_clk_en;
-    uint8_t gpio_debounce_wen;
-    uint32_t gpio_ext_data;
+    uint8_t pwrite;
     uint8_t gpio_int_level_sync_wen;
-    uint32_t gpio_int_type;
-    uint32_t gpio_int_clr;
-    uint32_t int_k;
-    uint32_t SUPPORT_INT_LEVEL_SYNC_PROC_int_level_sync_in_ff2;
+    uint8_t gpio_tx_data;
+    uint8_t pclk;
+    uint8_t gpio_debounce_wen;
     uint32_t ri_gpio_debounce;
-    uint32_t prdata;
     uint32_t ri_gpio_int_level_sync;
-    uint8_t gpio_int_clr_wen;
     uint32_t gpio_int_status_edge;
-    uint32_t ri_gpio_int_en;
+    uint8_t int_clk_en;
     uint32_t gpio_sw_data;
-    uint32_t int_edge_out;
+    uint32_t pwdata;
     uint8_t gpio_int_mask_wen;
-    uint32_t gpio_sw_dir;
-    uint32_t ri_gpio_sw_dir;
+    uint8_t psel;
+    uint32_t int_k;
+    uint8_t paddr;
     uint8_t gpio_int_pol_wen;
-    uint32_t SUPPORT_INT_LEVEL_SYNC_PROC_int_level_sync_in_ff1;
-    uint32_t gpio_int_status_level;
-    uint32_t ri_gpio_int_mask;
-    uint32_t int_level_ff1;
-    uint32_t gpio_rx_data_int;
+    uint32_t int_edge;
+    uint8_t gpio_tx_en;
     uint32_t ri_gpio_int_pol;
     uint32_t gpio_int_mask;
-    uint32_t gpio_int_en;
-    uint8_t unnamed;
+    uint32_t gpio_ext_data_tmp;
     uint32_t debounce_d2;
-    uint8_t gpio_sw_data_wen;
-    uint32_t ri_gpio_int_status;
-    uint8_t gpio_int_type_wen;
-    uint32_t int_level_sync_in;
-    uint8_t gpio_sw_dir_wen;
     uint32_t gpio_debounce;
     uint32_t ri_gpio_ext_data;
     uint32_t dbclk;  /* input */
     uint32_t dbclk_rstn;  /* input */
     uint32_t gpio_ext_porta;  /* input */
     uint32_t gpio_in_data;  /* input */
-    uint32_t gpio_int_status;  /* input */
-    uint32_t gpio_rx_data;  /* input */
-    uint32_t paddr;  /* input */
-    uint32_t pclk;  /* input */
-    uint32_t pclk_int;  /* input */
     uint32_t pclk_intr;  /* input */
-    uint32_t penable;  /* input */
-    uint32_t presetn;  /* input */
-    uint32_t psel;  /* input */
-    uint32_t pwdata;  /* input */
-    uint32_t pwrite;  /* input */
     uint32_t scan_mode;  /* input */
 } gpio_top_state;
 
