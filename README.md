@@ -16,10 +16,122 @@
 **新增功能：**
 
 1. **WEN 信号追踪（四步法）**: 检测非时钟触发的寄存器写入
-   - **Step 1**: `isClockTriggeredProcess()` - 使用 `isClockSignalByUsagePattern` + `isClockByTriggerEffect` 判断 process 是否时钟触发
-   - **Step 2**: `extractWenTriggeredWrites()` - 提取非时钟触发 process 的写入目标
-   - **Step 3**: `extractWenAddressMappings()` - 追踪 WEN 信号的地址条件
-   - **Step 4**: `mergeWenMappings()` - 合并 WEN→寄存器 和 WEN→地址 映射
+
+   **流程图：**
+   ```
+   ┌─────────────────────────────────────────────────────────────────┐
+   │                     Step 1: 时钟触发检测                         │
+   │  ┌───────────────────────────────────────────────────────────┐  │
+   │  │ isClockTriggeredProcess(proc)                             │  │
+   │  │   ├─ isClockSignalByUsagePattern(sig, proc) // 结构特征   │  │
+   │  │   └─ isClockByTriggerEffect(sig, proc)      // 触发效果   │  │
+   │  │                                                           │  │
+   │  │ 结果: 时钟触发 → 跳过 | 非时钟触发 → 继续                  │  │
+   │  └───────────────────────────────────────────────────────────┘  │
+   └──────────────────────────┬──────────────────────────────────────┘
+                              │ 非时钟触发的 process
+                              ▼
+   ┌─────────────────────────────────────────────────────────────────┐
+   │                     Step 2: 写入目标提取                         │
+   │  ┌───────────────────────────────────────────────────────────┐  │
+   │  │ extractWenTriggeredWrites(proc)                           │  │
+   │  │   ├─ 遍历 proc 内所有 llhd.drv 操作                       │  │
+   │  │   └─ 提取: WEN 信号名 + 目标寄存器名                       │  │
+   │  │                                                           │  │
+   │  │ 输出: {gpio_int_clr_wen → gpio_int_clr}                   │  │
+   │  └───────────────────────────────────────────────────────────┘  │
+   └──────────────────────────┬──────────────────────────────────────┘
+                              │ WEN→寄存器 映射
+                              ▼
+   ┌─────────────────────────────────────────────────────────────────┐
+   │                     Step 3: 地址条件追踪                         │
+   │  ┌───────────────────────────────────────────────────────────┐  │
+   │  │ extractWenAddressMappings(moduleOp)                       │  │
+   │  │   ├─ 查找 drv *_wen 操作                                  │  │
+   │  │   ├─ 追踪: and(psel, penable, pwrite, icmp(paddr, const)) │  │
+   │  │   └─ 提取: WEN 信号 + 地址常量                             │  │
+   │  │                                                           │  │
+   │  │ 输出: {gpio_int_clr_wen → 0x60}                           │  │
+   │  └───────────────────────────────────────────────────────────┘  │
+   └──────────────────────────┬──────────────────────────────────────┘
+                              │ WEN→地址 映射
+                              ▼
+   ┌─────────────────────────────────────────────────────────────────┐
+   │                     Step 4: 映射合并                             │
+   │  ┌───────────────────────────────────────────────────────────┐  │
+   │  │ mergeWenMappings(wenWrites, wenAddrs)                     │  │
+   │  │   ├─ 合并: WEN→寄存器 + WEN→地址                           │  │
+   │  │   └─ 生成: APBRegisterMapping                             │  │
+   │  │                                                           │  │
+   │  │ 输出: {addr=0x60, reg=gpio_int_clr, width=32, W1C=true}   │  │
+   │  └───────────────────────────────────────────────────────────┘  │
+   └─────────────────────────────────────────────────────────────────┘
+   ```
+
+   **Step 1: `isClockTriggeredProcess()`** - 判断 process 是否时钟触发
+   ```cpp
+   // 两级检测：结构特征 + 触发效果
+   bool isClockTriggeredProcess(llhd::ProcessOp proc) {
+       for (auto sig : proc.getBody().getArguments()) {
+           // 1. 结构特征：单比特、在敏感列表、无逻辑驱动
+           if (!isClockSignalByUsagePattern(sig, proc)) continue;
+           // 2. 触发效果：所有 drv 都是 hold 模式 (reg = prb reg)
+           if (isClockByTriggerEffect(sig, proc)) return true;
+       }
+       return false;
+   }
+   ```
+
+   **Step 2: `extractWenTriggeredWrites()`** - 提取非时钟触发 process 的写入目标
+   ```cpp
+   // 遍历非时钟触发 process 的所有 drv 操作
+   std::map<std::string, std::string> extractWenTriggeredWrites(ProcessOp proc) {
+       std::map<std::string, std::string> wenToReg;
+       proc.walk([&](llhd::DrvOp drv) {
+           auto wenSig = getWenSignalFromCondition(drv);  // 从条件中提取 WEN
+           auto targetReg = getTargetSignalName(drv);     // 目标寄存器
+           wenToReg[wenSig] = targetReg;
+       });
+       return wenToReg;  // {gpio_int_clr_wen → gpio_int_clr}
+   }
+   ```
+
+   **Step 3: `extractWenAddressMappings()`** - 追踪 WEN 信号的地址条件
+   ```cpp
+   // 追踪 WEN 信号的地址来源
+   std::map<std::string, uint64_t> extractWenAddressMappings(HWModuleOp mod) {
+       std::map<std::string, uint64_t> wenToAddr;
+       mod.walk([&](llhd::DrvOp drv) {
+           if (!isWenSignal(drv.getTarget())) return;
+           // 追踪: and(psel, penable, pwrite, icmp(paddr, CONST))
+           if (auto addr = traceAddressFromCondition(drv)) {
+               wenToAddr[getSignalName(drv)] = *addr;
+           }
+       });
+       return wenToAddr;  // {gpio_int_clr_wen → 0x60}
+   }
+   ```
+
+   **Step 4: `mergeWenMappings()`** - 合并映射生成 APB 寄存器信息
+   ```cpp
+   // 合并 WEN→寄存器 和 WEN→地址，生成完整的 APB 映射
+   std::vector<APBRegisterMapping> mergeWenMappings(
+       const std::map<std::string, std::string>& wenToReg,
+       const std::map<std::string, uint64_t>& wenToAddr) {
+       std::vector<APBRegisterMapping> result;
+       for (auto& [wen, reg] : wenToReg) {
+           if (wenToAddr.count(wen)) {
+               APBRegisterMapping m;
+               m.address = wenToAddr.at(wen);
+               m.registerName = reg;
+               m.bitWidth = getRegWidth(reg);
+               m.isWritable = true;
+               result.push_back(m);
+           }
+       }
+       return result;
+   }
+   ```
 
 2. **APB 时钟检测修复**:
    - 之前：使用名字匹配 (`name.find("clk")`)
