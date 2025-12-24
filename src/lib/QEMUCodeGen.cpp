@@ -1,6 +1,7 @@
 #include "QEMUCodeGen.h"
 #include "llvm/Support/Format.h"
 #include <cctype>
+#include <set>
 
 namespace qemu_codegen {
 
@@ -66,6 +67,10 @@ void QEMUDeviceGenerator::setCombinationalLogic(const std::vector<clk_analysis::
   combinationalLogic_ = logic;
 }
 
+void QEMUDeviceGenerator::setAddressConflicts(const std::vector<clk_analysis::AddressConflict> &conflicts) {
+  addressConflicts_ = conflicts;
+}
+
 void QEMUDeviceGenerator::generateHeader(llvm::raw_ostream &os) {
   std::string upperName = toUpperCase(deviceName_);
 
@@ -96,9 +101,14 @@ void QEMUDeviceGenerator::generateHeader(llvm::raw_ostream &os) {
   os << "    MemoryRegion iomem;\n";
   os << "    qemu_irq irq;\n\n";
 
-  // 生成寄存器字段
+  // 生成寄存器字段（使用 set 避免重复声明）
+  std::set<std::string> emittedSignals;
   for (const auto &sig : signals_) {
     std::string safeName = sanitizeName(sig.name);
+    if (emittedSignals.count(safeName)) {
+      continue;  // 跳过重复的信号
+    }
+    emittedSignals.insert(safeName);
     if (sig.type == QEMUSignalType::ICOUNT_COUNTER) {
       os << "    /* ptimer-based counter: " << sig.name << " */\n";
       os << "    ptimer_state *" << safeName << "_ptimer;\n";
@@ -111,40 +121,22 @@ void QEMUDeviceGenerator::generateHeader(llvm::raw_ostream &os) {
 
   // 生成输入信号字段（用于存储和比较）
   for (const auto &input : inputSignals_) {
-    // 跳过已经在 signals_ 中的
-    bool found = false;
-    for (const auto &sig : signals_) {
-      if (sig.name == input.first) {
-        found = true;
-        break;
-      }
+    std::string safeName = sanitizeName(input.first);
+    if (emittedSignals.count(safeName)) {
+      continue;  // 跳过已生成的信号
     }
-    if (!found) {
-      std::string safeName = sanitizeName(input.first);
-      os << "    " << getCType(input.second) << " " << safeName << ";  /* input */\n";
-    }
+    emittedSignals.insert(safeName);
+    os << "    " << getCType(input.second) << " " << safeName << ";  /* input */\n";
   }
 
   // 生成 GPIO 外部输入信号字段
   for (const auto &gpio : gpioInputSignals_) {
-    // 跳过已经在 signals_ 或 inputSignals_ 中的
-    bool found = false;
-    for (const auto &sig : signals_) {
-      if (sig.name == gpio.first) {
-        found = true;
-        break;
-      }
+    std::string safeName = sanitizeName(gpio.first);
+    if (emittedSignals.count(safeName)) {
+      continue;  // 跳过已生成的信号
     }
-    for (const auto &input : inputSignals_) {
-      if (input.first == gpio.first) {
-        found = true;
-        break;
-      }
-    }
-    if (!found) {
-      std::string safeName = sanitizeName(gpio.first);
-      os << "    " << getCType(gpio.second) << " " << safeName << ";  /* gpio input */\n";
-    }
+    emittedSignals.insert(safeName);
+    os << "    " << getCType(gpio.second) << " " << safeName << ";  /* gpio input */\n";
   }
 
   os << "} " << deviceName_ << "_state;\n\n";
@@ -340,11 +332,84 @@ void QEMUDeviceGenerator::generateMMIORead(llvm::raw_ostream &os) {
   os << "    uint64_t value = 0;\n\n";
   os << "    switch (addr) {\n";
 
+  // 收集冲突地址
+  std::set<uint32_t> conflictAddresses;
+  for (const auto &conflict : addressConflicts_) {
+    conflictAddresses.insert(conflict.address);
+  }
+
   // 如果有 APB 映射，使用真实地址
   if (!apbMappings_.empty()) {
+    // 先生成冲突地址的特殊处理
+    for (const auto &conflict : addressConflicts_) {
+      os << "    case 0x" << llvm::format_hex_no_prefix(conflict.address, 2)
+         << ":  /* CONFLICT: ";
+      for (size_t i = 0; i < conflict.registerNames.size(); ++i) {
+        if (i > 0) os << " + ";
+        os << conflict.registerNames[i];
+      }
+      os << " */\n";
+
+      // 根据冲突模式生成读取代码
+      if (conflict.recommendedMode == clk_analysis::AddressConflict::ResolveMode::BIT_FIELD) {
+        // BIT_FIELD 模式：读取较小位宽的寄存器（通常是配置位）
+        // 找到最小位宽的可读寄存器
+        int minWidth = 32;
+        std::string readReg;
+        for (size_t i = 0; i < conflict.registerNames.size(); ++i) {
+          if (conflict.isReadable[i] && conflict.bitWidths[i] < minWidth) {
+            minWidth = conflict.bitWidths[i];
+            readReg = conflict.registerNames[i];
+          }
+        }
+        if (!readReg.empty()) {
+          os << "        value = s->" << sanitizeName(readReg) << ";\n";
+        } else {
+          os << "        value = 0;  /* TODO: no readable register */\n";
+        }
+      } else if (conflict.recommendedMode == clk_analysis::AddressConflict::ResolveMode::READ_WRITE_ASYM) {
+        // READ_WRITE_ASYM 模式：读取只读的那个寄存器
+        std::string readReg;
+        for (size_t i = 0; i < conflict.registerNames.size(); ++i) {
+          if (conflict.isReadable[i] && !conflict.isWritable[i]) {
+            readReg = conflict.registerNames[i];
+            break;
+          }
+        }
+        if (readReg.empty()) {
+          // 如果没有只读寄存器，读取第一个可读的
+          for (size_t i = 0; i < conflict.registerNames.size(); ++i) {
+            if (conflict.isReadable[i]) {
+              readReg = conflict.registerNames[i];
+              break;
+            }
+          }
+        }
+        if (!readReg.empty()) {
+          os << "        value = s->" << sanitizeName(readReg) << ";\n";
+        } else {
+          os << "        value = 0;  /* TODO: no readable register */\n";
+        }
+      } else {
+        // UNKNOWN 或 COMBINED 模式：读取第一个可读寄存器
+        for (size_t i = 0; i < conflict.registerNames.size(); ++i) {
+          if (conflict.isReadable[i]) {
+            os << "        value = s->" << sanitizeName(conflict.registerNames[i]) << ";\n";
+            break;
+          }
+        }
+      }
+      os << "        break;\n";
+    }
+
+    // 生成非冲突地址的普通映射
     for (const auto &mapping : apbMappings_) {
       if (!mapping.isReadable)
         continue;
+      // 跳过冲突地址
+      if (conflictAddresses.count(mapping.address))
+        continue;
+
       std::string safeName = sanitizeName(mapping.registerName);
       os << "    case 0x" << llvm::format_hex_no_prefix(mapping.address, 2)
          << ":  /* " << mapping.registerName << " */\n";
@@ -397,11 +462,98 @@ void QEMUDeviceGenerator::generateMMIOWrite(llvm::raw_ostream &os) {
   os << "    " << deviceName_ << "_state *s = opaque;\n\n";
   os << "    switch (addr) {\n";
 
+  // 收集冲突地址
+  std::set<uint32_t> conflictAddresses;
+  for (const auto &conflict : addressConflicts_) {
+    conflictAddresses.insert(conflict.address);
+  }
+
   // 如果有 APB 映射，使用真实地址
   if (!apbMappings_.empty()) {
+    // 先生成冲突地址的特殊处理
+    for (const auto &conflict : addressConflicts_) {
+      os << "    case 0x" << llvm::format_hex_no_prefix(conflict.address, 2)
+         << ":  /* CONFLICT: ";
+      for (size_t i = 0; i < conflict.registerNames.size(); ++i) {
+        if (i > 0) os << " + ";
+        os << conflict.registerNames[i];
+      }
+      os << " */\n";
+
+      // 根据冲突模式生成写入代码
+      if (conflict.recommendedMode == clk_analysis::AddressConflict::ResolveMode::BIT_FIELD) {
+        // BIT_FIELD 模式：
+        // - 小位宽寄存器写入对应的低位
+        // - 大位宽寄存器用于 W1C 清除操作
+        int minWidth = 33;
+        std::string smallReg, largeReg;
+        int smallIdx = -1, largeIdx = -1;
+
+        for (size_t i = 0; i < conflict.registerNames.size(); ++i) {
+          if (conflict.isWritable[i]) {
+            if (conflict.bitWidths[i] < minWidth) {
+              minWidth = conflict.bitWidths[i];
+              smallReg = conflict.registerNames[i];
+              smallIdx = i;
+            }
+            if (conflict.bitWidths[i] >= 32) {
+              largeReg = conflict.registerNames[i];
+              largeIdx = i;
+            }
+          }
+        }
+
+        // 写入小位宽寄存器（配置位）
+        if (!smallReg.empty() && minWidth < 32) {
+          os << "        s->" << sanitizeName(smallReg) << " = value & "
+             << ((1ULL << minWidth) - 1) << ";  /* " << minWidth << "-bit */\n";
+        }
+
+        // 大位宽寄存器通常是 W1C 模式，用于清除中断
+        // gpio_int_clr 写入会清除 gpio_int_status 的对应位
+        if (!largeReg.empty()) {
+          // 检查是否是 W1C 模式（写 1 清除）
+          // 通常 _clr 寄存器用于清除 _status 寄存器
+          std::string statusReg;
+          if (largeReg.find("_clr") != std::string::npos) {
+            statusReg = largeReg;
+            size_t pos = statusReg.find("_clr");
+            statusReg.replace(pos, 4, "_status");
+          }
+          if (!statusReg.empty()) {
+            os << "        s->" << sanitizeName(statusReg) << " &= ~value;  /* W1C */\n";
+          } else {
+            os << "        s->" << sanitizeName(largeReg) << " = value;\n";
+          }
+        }
+      } else if (conflict.recommendedMode == clk_analysis::AddressConflict::ResolveMode::READ_WRITE_ASYM) {
+        // READ_WRITE_ASYM 模式：写入只写的那个寄存器
+        for (size_t i = 0; i < conflict.registerNames.size(); ++i) {
+          if (conflict.isWritable[i]) {
+            os << "        s->" << sanitizeName(conflict.registerNames[i]) << " = value;\n";
+            break;
+          }
+        }
+      } else {
+        // UNKNOWN 模式：写入所有可写寄存器（注释提醒需要手动处理）
+        os << "        /* TODO: UNKNOWN conflict mode - needs manual review */\n";
+        for (size_t i = 0; i < conflict.registerNames.size(); ++i) {
+          if (conflict.isWritable[i]) {
+            os << "        s->" << sanitizeName(conflict.registerNames[i]) << " = value;\n";
+          }
+        }
+      }
+      os << "        break;\n";
+    }
+
+    // 生成非冲突地址的普通映射
     for (const auto &mapping : apbMappings_) {
       if (!mapping.isWritable)
         continue;
+      // 跳过冲突地址
+      if (conflictAddresses.count(mapping.address))
+        continue;
+
       std::string safeName = sanitizeName(mapping.registerName);
       os << "    case 0x" << llvm::format_hex_no_prefix(mapping.address, 2)
          << ":  /* " << mapping.registerName << " */\n";
@@ -549,8 +701,13 @@ void QEMUDeviceGenerator::generateDeviceInit(llvm::raw_ostream &os) {
   os << "static void " << deviceName_ << "_reset(DeviceState *dev)\n";
   os << "{\n";
   os << "    " << deviceName_ << "_state *s = " << upperName << "(dev);\n\n";
+  std::set<std::string> resetSignals;
   for (const auto &sig : signals_) {
     std::string safeName = sanitizeName(sig.name);
+    if (resetSignals.count(safeName)) {
+      continue;  // 跳过重复的信号
+    }
+    resetSignals.insert(safeName);
     if (sig.type == QEMUSignalType::ICOUNT_COUNTER) {
       os << "    /* 重置 ptimer: " << sig.name << " */\n";
       os << "    ptimer_transaction_begin(s->" << safeName << "_ptimer);\n";
@@ -867,6 +1024,12 @@ void QEMUDeviceGenerator::generateActionCode(llvm::raw_ostream &os,
                                               const clk_analysis::EventAction &action,
                                               int indentLevel) {
   using namespace clk_analysis;
+
+  // 检查目标信号是否在状态结构体中定义
+  // 如果信号不存在（如 APB 输出信号 prdata），则跳过
+  if (!signalExists(action.targetSignal)) {
+    return;  // 目标信号不在状态结构体中，跳过
+  }
 
   indent(os, indentLevel);
 

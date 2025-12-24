@@ -78,6 +78,9 @@ public:
   /// 设置组合逻辑赋值
   void setCombinationalLogic(const std::vector<clk_analysis::CombinationalAssignment> &logic);
 
+  /// 设置地址冲突信息
+  void setAddressConflicts(const std::vector<clk_analysis::AddressConflict> &conflicts);
+
   /// 生成 QEMU 设备头文件
   void generateHeader(llvm::raw_ostream &os);
 
@@ -95,6 +98,7 @@ private:
   std::map<std::string, std::string> inputSignalTypes_;  // 输入信号分类
   std::vector<clk_analysis::APBRegisterMapping> apbMappings_;  // APB 寄存器映射
   std::vector<clk_analysis::CombinationalAssignment> combinationalLogic_;  // 组合逻辑
+  std::vector<clk_analysis::AddressConflict> addressConflicts_;  // 地址冲突信息
 
   /// 生成 ptimer 回调函数
   void generatePtimerCallback(llvm::raw_ostream &os);

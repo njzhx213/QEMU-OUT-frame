@@ -14,6 +14,8 @@
 #include "circt/Dialect/Seq/SeqOps.h"
 #include <functional>
 #include <algorithm>
+#include <map>
+#include <set>
 
 using namespace mlir;
 using namespace circt;
@@ -1375,9 +1377,13 @@ void detectControlRelations(const std::vector<EventHandler> &handlers,
 
 } // anonymous namespace
 
-// Forward declaration
+// Forward declarations
 void extractAPBRegisterMappings(ModuleOp mod,
                                  std::vector<APBRegisterMapping> &mappings);
+static void analyzeWriteCharacteristics(hw::HWModuleOp hwMod,
+                                         std::vector<APBRegisterMapping> &mappings);
+static void detectAddressConflicts(const std::vector<APBRegisterMapping> &mappings,
+                                    std::vector<AddressConflict> &conflicts);
 
 ModuleAnalysisResult analyzeModuleWithEvents(mlir::ModuleOp mod) {
   // 首先进行基本分析
@@ -1420,12 +1426,678 @@ ModuleAnalysisResult analyzeModuleWithEvents(mlir::ModuleOp mod) {
   // 提取 APB 寄存器地址映射
   extractAPBRegisterMappings(mod, result.apbMappings);
 
+  // 分析写入特征（extract, W1C 等）
+  mod.walk([&](hw::HWModuleOp hwMod) {
+    analyzeWriteCharacteristics(hwMod, result.apbMappings);
+  });
+
+  // 检测地址冲突并推荐处理模式
+  detectAddressConflicts(result.apbMappings, result.addressConflicts);
+
   return result;
 }
 
 //===----------------------------------------------------------------------===//
 // APB 寄存器地址映射提取（使用 SignalTracing 库）
 //===----------------------------------------------------------------------===//
+
+//===----------------------------------------------------------------------===//
+// Step 1-4: WEN 信号追踪（纯功能追踪，不依赖命名约定）
+//===----------------------------------------------------------------------===//
+
+/// Step 2 结果：wen 信号触发的寄存器写入
+struct WenTriggeredWrite {
+  std::string wenSignal;       // 触发信号（如 gpio_int_clr_wen 的 SSA 名或实际名）
+  mlir::Value wenSignalValue;  // 触发信号的 Value（用于匹配）
+  std::string targetRegister;  // 写入目标寄存器
+  int bitWidth;
+};
+
+/// Step 3 结果：wen 信号的地址条件
+struct WenAddressMapping {
+  std::string wenSignal;       // wen 信号名
+  mlir::Value wenSignalValue;  // wen 信号的 Value（用于匹配）
+  uint32_t address;            // 字节地址
+  bool requiresPwrite;         // 是否需要 pwrite 条件
+};
+
+/// Step 1: 判断 process 是否是时钟触发
+/// 返回 true 表示是 clock-triggered，false 表示是 signal-triggered
+/// 使用 SignalTracing.h 中的精确检测函数：
+/// - isClockSignalByUsagePattern: 结构检查（1-bit, 在敏感列表, 无逻辑 drv）
+/// - isClockByTriggerEffect: 触发效果检查（时钟=所有drv都是hold模式）
+static bool isClockTriggeredProcess(llhd::ProcessOp proc) {
+  bool hasClockTrigger = false;
+
+  proc.walk([&](llhd::WaitOp waitOp) {
+    // 检查 wait 的观察信号
+    for (Value observed : waitOp.getObserved()) {
+      // 追踪信号源
+      if (auto prbOp = observed.getDefiningOp<llhd::PrbOp>()) {
+        Value sig = prbOp.getSignal();
+
+        // Step 1: 使用结构检查（1-bit, 在敏感列表, 无逻辑 drv）
+        if (signal_tracing::isClockSignalByUsagePattern(sig, proc)) {
+          // Step 2: 使用触发效果检查（时钟=所有drv都是hold模式）
+          // 时钟触发的分支只执行 hold 操作（reg = prb reg）
+          // 复位/控制信号触发的分支会修改状态（如 counter = 0）
+          if (signal_tracing::isClockByTriggerEffect(sig, proc)) {
+            // 通过两级检测：是时钟信号
+            hasClockTrigger = true;
+            return WalkResult::interrupt();
+          }
+        }
+      }
+    }
+    return WalkResult::advance();
+  });
+
+  return hasClockTrigger;
+}
+
+/// Step 2: 提取 signal-triggered process 的写入目标
+/// 对于非时钟触发的 process，找到触发信号和写入的目标寄存器
+static void extractWenTriggeredWrites(llhd::ProcessOp proc,
+                                       std::vector<WenTriggeredWrite> &results) {
+  // 收集 wait 操作的触发信号
+  llvm::SmallVector<std::pair<mlir::Value, std::string>, 4> triggerSignals;
+
+  proc.walk([&](llhd::WaitOp waitOp) {
+    for (Value observed : waitOp.getObserved()) {
+      if (auto prbOp = observed.getDefiningOp<llhd::PrbOp>()) {
+        Value sig = prbOp.getSignal();
+        std::string sigName;
+        if (auto sigOp = sig.getDefiningOp<llhd::SignalOp>()) {
+          if (auto nameAttr = sigOp->getAttrOfType<StringAttr>("name")) {
+            sigName = nameAttr.getValue().str();
+          }
+        }
+        if (sigName.empty()) {
+          sigName = getSSAName(sig);
+        }
+        if (!sigName.empty()) {
+          triggerSignals.push_back({sig, sigName});
+        }
+      }
+    }
+  });
+
+  // 如果没有触发信号，跳过
+  if (triggerSignals.empty())
+    return;
+
+  // 收集 process 内的所有 drv 操作
+  llvm::StringMap<std::pair<mlir::Value, int>> writtenRegs;
+  proc.walk([&](llhd::DrvOp drv) {
+    Value target = drv.getSignal();
+    std::string regName;
+
+    // 处理 sig.extract（位级别写入）
+    if (auto sigExtract = target.getDefiningOp<llhd::SigExtractOp>()) {
+      target = sigExtract.getInput();
+    }
+
+    if (auto sigOp = target.getDefiningOp<llhd::SignalOp>()) {
+      if (auto nameAttr = sigOp->getAttrOfType<StringAttr>("name")) {
+        regName = nameAttr.getValue().str();
+      }
+    }
+    if (regName.empty()) {
+      regName = getSSAName(target);
+    }
+
+    if (!regName.empty()) {
+      int bitWidth = getSignalBitWidth(target);
+      writtenRegs[regName] = {target, bitWidth};
+    }
+  });
+
+  // 检查哪个触发信号是主要的触发条件
+  // 通常 process 入口会有 cf.cond_br 检查触发信号
+  mlir::Value primaryTrigger;
+  std::string primaryTriggerName;
+
+  Block *entryBlock = &proc.getBody().front();
+  for (Operation &op : *entryBlock) {
+    // 跳过入口的无条件跳转
+    if (isa<cf::BranchOp>(&op)) {
+      // 检查目标 block
+      auto br = cast<cf::BranchOp>(&op);
+      Block *dest = br.getDest();
+      // 检查目标 block 的第一个条件分支
+      for (Operation &destOp : *dest) {
+        if (auto condBr = dyn_cast<cf::CondBranchOp>(&destOp)) {
+          // 检查条件是否是某个触发信号的 prb
+          Value cond = condBr.getCondition();
+          if (auto prbOp = cond.getDefiningOp<llhd::PrbOp>()) {
+            Value sig = prbOp.getSignal();
+            for (const auto &trigger : triggerSignals) {
+              if (trigger.first == sig) {
+                primaryTrigger = sig;
+                primaryTriggerName = trigger.second;
+                break;
+              }
+            }
+          }
+          break;
+        }
+      }
+      break;
+    }
+
+    if (auto condBr = dyn_cast<cf::CondBranchOp>(&op)) {
+      Value cond = condBr.getCondition();
+      if (auto prbOp = cond.getDefiningOp<llhd::PrbOp>()) {
+        Value sig = prbOp.getSignal();
+        for (const auto &trigger : triggerSignals) {
+          if (trigger.first == sig) {
+            primaryTrigger = sig;
+            primaryTriggerName = trigger.second;
+            break;
+          }
+        }
+      }
+      break;
+    }
+  }
+
+  // 如果没有找到主要触发信号，使用第一个非时钟触发信号
+  if (!primaryTrigger && !triggerSignals.empty()) {
+    for (const auto &trigger : triggerSignals) {
+      // 跳过可能是时钟的信号
+      if (trigger.second.find("clk") == std::string::npos &&
+          trigger.second.find("clock") == std::string::npos) {
+        primaryTrigger = trigger.first;
+        primaryTriggerName = trigger.second;
+        break;
+      }
+    }
+  }
+
+  if (!primaryTrigger)
+    return;
+
+  // 为每个写入的寄存器创建 WenTriggeredWrite
+  // 排除触发信号本身（通常 wen 信号也会被写入 0 来清除）
+  for (const auto &reg : writtenRegs) {
+    if (reg.getKey() == primaryTriggerName)
+      continue;  // 跳过触发信号本身
+
+    WenTriggeredWrite result;
+    result.wenSignal = primaryTriggerName;
+    result.wenSignalValue = primaryTrigger;
+    result.targetRegister = reg.getKey().str();
+    result.bitWidth = reg.getValue().second;
+    results.push_back(result);
+  }
+}
+
+/// Step 3: 追踪 wen 信号的地址条件
+/// 找到设置 wen 信号的 process，提取 paddr 条件
+static void extractWenAddressMappings(hw::HWModuleOp hwMod,
+                                       const std::vector<WenTriggeredWrite> &wenWrites,
+                                       std::vector<WenAddressMapping> &results) {
+  // 收集需要追踪的 wen 信号
+  llvm::StringSet<> wenSignalsToTrack;
+  llvm::DenseMap<mlir::Value, std::string> wenValueToName;
+  for (const auto &w : wenWrites) {
+    wenSignalsToTrack.insert(w.wenSignal);
+    if (w.wenSignalValue)
+      wenValueToName[w.wenSignalValue] = w.wenSignal;
+  }
+
+  // 遍历所有 process，找到设置 wen 信号的
+  hwMod.walk([&](llhd::ProcessOp proc) {
+    // 收集这个 process 写入的 wen 信号
+    llvm::SmallVector<std::pair<mlir::Value, std::string>, 4> wenDrvsInProcess;
+
+    proc.walk([&](llhd::DrvOp drv) {
+      Value target = drv.getSignal();
+      std::string targetName;
+
+      if (auto sigOp = target.getDefiningOp<llhd::SignalOp>()) {
+        if (auto nameAttr = sigOp->getAttrOfType<StringAttr>("name")) {
+          targetName = nameAttr.getValue().str();
+        }
+      }
+      if (targetName.empty()) {
+        targetName = getSSAName(target);
+      }
+
+      // 检查是否是我们要追踪的 wen 信号
+      if (wenSignalsToTrack.contains(targetName)) {
+        wenDrvsInProcess.push_back({target, targetName});
+      }
+    });
+
+    if (wenDrvsInProcess.empty())
+      return;
+
+    // 分析这个 process 中的 paddr 条件
+    // 策略：从 drv wen_signal, true 的位置向上追溯，找到 paddr 比较
+    for (const auto &wenDrv : wenDrvsInProcess) {
+      // 找到 drv wen_signal, true 的操作
+      proc.walk([&](llhd::DrvOp drv) {
+        if (drv.getSignal() != wenDrv.first)
+          return;
+
+        // 检查是否是设置为 true
+        Value drvValue = drv.getValue();
+        auto constOp = drvValue.getDefiningOp<hw::ConstantOp>();
+        if (!constOp || !constOp.getValue().isOne())
+          return;
+
+        // 从这个 drv 的 block 向上追溯，找到 paddr 条件
+        Block *drvBlock = drv->getBlock();
+        std::optional<uint32_t> foundAddress;
+        bool foundPwrite = false;
+
+        llvm::SmallPtrSet<Block*, 16> visited;
+        std::function<void(Block*)> traceBack;
+        traceBack = [&](Block *block) {
+          if (!block || visited.count(block))
+            return;
+          visited.insert(block);
+
+          for (auto *pred : block->getPredecessors()) {
+            auto *terminator = pred->getTerminator();
+            if (auto condBr = dyn_cast<cf::CondBranchOp>(terminator)) {
+              // 只分析 true 分支
+              if (condBr.getTrueDest() != block)
+                continue;
+
+              Value cond = condBr.getCondition();
+
+              // 检查是否是 icmp(paddr, const)
+              if (auto icmp = cond.getDefiningOp<comb::ICmpOp>()) {
+                if (icmp.getPredicate() == comb::ICmpPredicate::eq) {
+                  hw::ConstantOp addrConst = nullptr;
+                  Value compareVal = nullptr;
+
+                  if (auto c = icmp.getRhs().getDefiningOp<hw::ConstantOp>()) {
+                    addrConst = c;
+                    compareVal = icmp.getLhs();
+                  } else if (auto c = icmp.getLhs().getDefiningOp<hw::ConstantOp>()) {
+                    addrConst = c;
+                    compareVal = icmp.getRhs();
+                  }
+
+                  if (addrConst) {
+                    // 检查是否与 paddr 相关
+                    bool isPaddrRelated = false;
+
+                    if (auto extract = compareVal.getDefiningOp<comb::ExtractOp>()) {
+                      auto sig = signal_tracing::traceToSignal(extract.getInput());
+                      if (sig.isValid() && sig.name.contains("paddr")) {
+                        isPaddrRelated = true;
+                      }
+                    }
+
+                    if (isPaddrRelated && !foundAddress) {
+                      foundAddress = addrConst.getValue().getZExtValue() << 2;  // 转换为字节地址
+                    }
+                  }
+                }
+              }
+
+              // 检查是否是 and(psel, penable, pwrite) 条件
+              if (auto andOp = cond.getDefiningOp<comb::AndOp>()) {
+                auto branchCond = signal_tracing::analyzeAndCondition(andOp);
+                if (branchCond.hasPwrite && branchCond.pwriteValue) {
+                  foundPwrite = true;
+                }
+              }
+            }
+
+            // 继续向上追溯
+            traceBack(pred);
+          }
+        };
+
+        traceBack(drvBlock);
+
+        if (foundAddress) {
+          WenAddressMapping mapping;
+          mapping.wenSignal = wenDrv.second;
+          mapping.wenSignalValue = wenDrv.first;
+          mapping.address = *foundAddress;
+          mapping.requiresPwrite = foundPwrite;
+
+          // 检查是否已存在
+          bool exists = false;
+          for (const auto &existing : results) {
+            if (existing.wenSignal == mapping.wenSignal &&
+                existing.address == mapping.address) {
+              exists = true;
+              break;
+            }
+          }
+          if (!exists) {
+            results.push_back(mapping);
+            llvm::errs() << "[WEN-TRACK] Found: " << mapping.wenSignal
+                         << " at address 0x";
+            llvm::errs().write_hex(mapping.address);
+            llvm::errs() << " (pwrite: " << (mapping.requiresPwrite ? "Y" : "N") << ")\n";
+          }
+        }
+      });
+    }
+  });
+}
+
+/// Step 4: 合并 wen → register 和 wen → address 映射
+/// 生成最终的 APB 寄存器映射
+static void mergeWenMappings(const std::vector<WenTriggeredWrite> &wenWrites,
+                              const std::vector<WenAddressMapping> &wenAddrs,
+                              std::vector<APBRegisterMapping> &mappings) {
+  for (const auto &wenWrite : wenWrites) {
+    for (const auto &wenAddr : wenAddrs) {
+      // 通过 wenSignal 名字或 Value 匹配
+      bool match = (wenWrite.wenSignal == wenAddr.wenSignal);
+      if (!match && wenWrite.wenSignalValue && wenAddr.wenSignalValue) {
+        match = (wenWrite.wenSignalValue == wenAddr.wenSignalValue);
+      }
+
+      if (match) {
+        // 检查是否已存在此地址+名字完全匹配的映射
+        bool exactMatch = false;
+        bool addressConflict = false;
+        for (auto &existing : mappings) {
+          if (existing.address == wenAddr.address) {
+            if (existing.registerName.empty()) {
+              // 更新空的映射
+              existing.registerName = wenWrite.targetRegister;
+              existing.isWritable = wenAddr.requiresPwrite;
+              existing.bitWidth = wenWrite.bitWidth;
+              exactMatch = true;
+              break;
+            } else if (existing.registerName == wenWrite.targetRegister) {
+              // 完全相同，更新属性
+              existing.isWritable = wenAddr.requiresPwrite;
+              existing.bitWidth = wenWrite.bitWidth;
+              exactMatch = true;
+              break;
+            } else {
+              // 同一地址有不同的寄存器名 - 地址冲突！
+              addressConflict = true;
+              llvm::errs() << "\n[CONFLICT-DETECT] Address 0x";
+              llvm::errs().write_hex(wenAddr.address);
+              llvm::errs() << " has multiple registers:\n";
+              llvm::errs() << "  1. " << existing.registerName
+                           << " (width=" << existing.bitWidth
+                           << ", R=" << (existing.isReadable ? "Y" : "N")
+                           << ", W=" << (existing.isWritable ? "Y" : "N")
+                           << ", extract=" << (existing.writeUsesExtract ? "Y" : "N");
+              if (existing.writeUsesExtract)
+                llvm::errs() << " bit=" << existing.writeExtractBit;
+              llvm::errs() << ")\n";
+              llvm::errs() << "  2. " << wenWrite.targetRegister
+                           << " (width=" << wenWrite.bitWidth << ")\n";
+
+              // 分析应该使用哪种 QEMU 模式
+              // 方式1: BIT_FIELD - 不同寄存器占用不同位域
+              //   特征: 一个使用 extract(pwdata, bit)，另一个使用完整 pwdata
+              //   或者: 位宽不同（如 1-bit vs 32-bit）
+              // 方式2: READ_WRITE_ASYM - 读写不对称
+              //   特征: 一个只读，另一个只写
+              //   或者: 读返回一个值，写影响另一个值
+
+              std::string recommendedMode;
+              std::string reason;
+
+              if (existing.writeUsesExtract && existing.bitWidth == 1 &&
+                  wenWrite.bitWidth > 1) {
+                // 现有的使用 extract 且是 1-bit，新的是多位
+                recommendedMode = "BIT_FIELD";
+                reason = "existing uses extract(pwdata, bit) with 1-bit width, new is multi-bit";
+              } else if (existing.bitWidth == 1 && wenWrite.bitWidth == 32) {
+                // 1-bit vs 32-bit
+                recommendedMode = "BIT_FIELD";
+                reason = "different bit widths (1 vs 32)";
+              } else if (existing.isReadable && !existing.isWritable &&
+                         wenWrite.bitWidth > 0) {
+                // 现有的只读，新的可写
+                recommendedMode = "READ_WRITE_ASYM";
+                reason = "existing is read-only, new is writable";
+              } else if (existing.isW1C) {
+                // W1C 模式通常意味着写影响不同的信号
+                recommendedMode = "READ_WRITE_ASYM";
+                reason = "existing uses W1C (Write-1-to-Clear) pattern";
+              } else {
+                recommendedMode = "UNKNOWN";
+                reason = "cannot determine automatically";
+              }
+
+              llvm::errs() << "[CONFLICT-DETECT] Recommended mode: " << recommendedMode
+                           << " (" << reason << ")\n\n";
+              // 不 break，继续检查是否有完全匹配
+            }
+          }
+        }
+
+        // 如果没有完全匹配，添加新的映射（包括冲突的情况）
+        if (!exactMatch) {
+          APBRegisterMapping mapping;
+          mapping.address = wenAddr.address;
+          mapping.registerName = wenWrite.targetRegister;
+          mapping.bitWidth = wenWrite.bitWidth;
+          mapping.isWritable = wenAddr.requiresPwrite;
+          mapping.isReadable = true;
+          mappings.push_back(mapping);
+
+          if (addressConflict) {
+            llvm::errs() << "[WEN-TRACK] Added conflicting register: "
+                         << mapping.registerName << " at 0x";
+            llvm::errs().write_hex(mapping.address);
+            llvm::errs() << "\n";
+          } else {
+            llvm::errs() << "[WEN-TRACK] Merged: " << mapping.registerName
+                         << " at 0x";
+            llvm::errs().write_hex(mapping.address);
+            llvm::errs() << " (via " << wenWrite.wenSignal << ")\n";
+          }
+        }
+      }
+    }
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// 地址冲突检测与处理模式推荐
+//===----------------------------------------------------------------------===//
+
+/// 分析写入值是否使用 extract(pwdata, bit)
+/// 返回 {usesExtract, extractBit}
+static std::pair<bool, int> analyzeWriteValueExtract(mlir::Value writeValue) {
+  // 检查是否是 comb.extract 操作
+  if (auto extractOp = writeValue.getDefiningOp<comb::ExtractOp>()) {
+    // 检查输入是否来自 pwdata（通过 llhd.prb）
+    mlir::Value input = extractOp.getInput();
+    if (auto prbOp = input.getDefiningOp<llhd::PrbOp>()) {
+      mlir::Value sig = prbOp.getSignal();
+      if (auto sigOp = sig.getDefiningOp<llhd::SignalOp>()) {
+        if (auto nameAttr = sigOp->getAttrOfType<StringAttr>("name")) {
+          std::string name = nameAttr.getValue().str();
+          if (name.find("pwdata") != std::string::npos) {
+            int lowBit = extractOp.getLowBit();
+            return {true, lowBit};
+          }
+        }
+      }
+    }
+  }
+  return {false, 0};
+}
+
+/// 检测写入是否是 W1C 模式: reg = reg & ~value
+/// W1C 模式的 LLHD 表示: drv reg, (and (prb reg) (not value))
+static bool isW1CWritePattern(llhd::DrvOp drv) {
+  mlir::Value target = drv.getSignal();
+  mlir::Value value = drv.getValue();
+
+  // 检查 value 是否是 and 操作
+  if (auto andOp = value.getDefiningOp<comb::AndOp>()) {
+    // 检查是否有一个操作数是 prb target，另一个是 not/xor
+    for (mlir::Value operand : andOp.getInputs()) {
+      // 检查是否是 prb target
+      if (auto prbOp = operand.getDefiningOp<llhd::PrbOp>()) {
+        if (prbOp.getSignal() == target) {
+          // 找到了 prb target，现在检查其他操作数是否包含 not/xor
+          for (mlir::Value other : andOp.getInputs()) {
+            if (other == operand) continue;
+            // 检查是否是 xor (not 的一种表示)
+            if (auto xorOp = other.getDefiningOp<comb::XorOp>()) {
+              // 可能是 W1C
+              return true;
+            }
+          }
+        }
+      }
+    }
+  }
+  return false;
+}
+
+/// 检测地址冲突并推荐处理模式
+static void detectAddressConflicts(
+    const std::vector<APBRegisterMapping> &mappings,
+    std::vector<AddressConflict> &conflicts) {
+
+  // 按地址分组
+  std::map<uint32_t, std::vector<size_t>> addressGroups;
+  for (size_t i = 0; i < mappings.size(); ++i) {
+    addressGroups[mappings[i].address].push_back(i);
+  }
+
+  // 检测冲突
+  for (const auto &group : addressGroups) {
+    if (group.second.size() <= 1) continue;  // 无冲突
+
+    AddressConflict conflict;
+    conflict.address = group.first;
+
+    for (size_t idx : group.second) {
+      const auto &reg = mappings[idx];
+      conflict.registerNames.push_back(reg.registerName);
+      conflict.bitWidths.push_back(reg.bitWidth);
+      conflict.isReadable.push_back(reg.isReadable);
+      conflict.isWritable.push_back(reg.isWritable);
+      conflict.writeUsesExtract.push_back(reg.writeUsesExtract);
+      conflict.writeExtractBits.push_back(reg.writeExtractBit);
+    }
+
+    // 推荐处理模式
+    bool hasDifferentBitWidths = false;
+    bool hasExtractWrite = false;
+    bool allWritable = true;
+    bool hasReadOnly = false;
+    bool hasWriteOnly = false;
+
+    for (size_t i = 0; i < conflict.registerNames.size(); ++i) {
+      if (i > 0 && conflict.bitWidths[i] != conflict.bitWidths[0]) {
+        hasDifferentBitWidths = true;
+      }
+      if (conflict.writeUsesExtract[i]) {
+        hasExtractWrite = true;
+      }
+      if (!conflict.isWritable[i]) {
+        allWritable = false;
+      }
+      if (!conflict.isReadable[i] && conflict.isWritable[i]) {
+        hasWriteOnly = true;
+      }
+      if (conflict.isReadable[i] && !conflict.isWritable[i]) {
+        hasReadOnly = true;
+      }
+    }
+
+    // 决策逻辑
+    if (hasDifferentBitWidths && hasExtractWrite) {
+      // 位宽不同且写入使用 extract → 位域模式
+      conflict.recommendedMode = AddressConflict::ResolveMode::BIT_FIELD;
+    } else if (hasWriteOnly || hasReadOnly) {
+      // 有只写或只读寄存器 → 读写不对称模式
+      conflict.recommendedMode = AddressConflict::ResolveMode::READ_WRITE_ASYM;
+    } else if (hasDifferentBitWidths) {
+      // 仅位宽不同 → 混合模式
+      conflict.recommendedMode = AddressConflict::ResolveMode::COMBINED;
+    } else {
+      conflict.recommendedMode = AddressConflict::ResolveMode::UNKNOWN;
+    }
+
+    // 输出冲突信息
+    llvm::errs() << "[CONFLICT] Address 0x";
+    llvm::errs().write_hex(conflict.address);
+    llvm::errs() << " has " << conflict.registerNames.size() << " registers:\n";
+    for (size_t i = 0; i < conflict.registerNames.size(); ++i) {
+      llvm::errs() << "  - " << conflict.registerNames[i]
+                   << " (i" << conflict.bitWidths[i] << ")";
+      if (conflict.isReadable[i]) llvm::errs() << " [R]";
+      if (conflict.isWritable[i]) llvm::errs() << " [W]";
+      if (conflict.writeUsesExtract[i]) {
+        llvm::errs() << " [extract bit " << conflict.writeExtractBits[i] << "]";
+      }
+      llvm::errs() << "\n";
+    }
+
+    // 输出推荐模式
+    llvm::errs() << "  Recommended mode: ";
+    switch (conflict.recommendedMode) {
+      case AddressConflict::ResolveMode::BIT_FIELD:
+        llvm::errs() << "BIT_FIELD (different bits have different functions)\n";
+        break;
+      case AddressConflict::ResolveMode::READ_WRITE_ASYM:
+        llvm::errs() << "READ_WRITE_ASYM (read returns one value, write affects another)\n";
+        break;
+      case AddressConflict::ResolveMode::COMBINED:
+        llvm::errs() << "COMBINED (bit field + read/write asymmetry)\n";
+        break;
+      case AddressConflict::ResolveMode::UNKNOWN:
+        llvm::errs() << "UNKNOWN (manual handling required)\n";
+        break;
+    }
+
+    conflicts.push_back(conflict);
+  }
+}
+
+/// 分析寄存器的写入特征（在提取映射后调用）
+static void analyzeWriteCharacteristics(
+    hw::HWModuleOp hwMod,
+    std::vector<APBRegisterMapping> &mappings) {
+
+  // 遍历所有 drv 操作，分析写入特征
+  hwMod.walk([&](llhd::DrvOp drv) {
+    mlir::Value target = drv.getSignal();
+    std::string targetName;
+
+    // 获取目标信号名
+    if (auto sigOp = target.getDefiningOp<llhd::SignalOp>()) {
+      if (auto nameAttr = sigOp->getAttrOfType<StringAttr>("name")) {
+        targetName = nameAttr.getValue().str();
+      }
+    }
+
+    if (targetName.empty()) return;
+
+    // 查找对应的映射
+    for (auto &mapping : mappings) {
+      if (mapping.registerName == targetName && mapping.isWritable) {
+        // 分析写入值
+        auto [usesExtract, extractBit] = analyzeWriteValueExtract(drv.getValue());
+        if (usesExtract) {
+          mapping.writeUsesExtract = true;
+          mapping.writeExtractBit = extractBit;
+        }
+
+        // 检测 W1C 模式
+        if (isW1CWritePattern(drv)) {
+          mapping.isW1C = true;
+        }
+      }
+    }
+  });
+}
 
 /// 从模块中提取 APB 寄存器地址映射
 /// 新策略: 使用 SignalTracing 库追踪 and(psel, penable, pwrite) → cond_br → drv
@@ -1573,7 +2245,13 @@ void extractAPBRegisterMappings(ModuleOp mod,
                 APBRegisterMapping mapping;
                 mapping.address = byteAddr;
                 mapping.registerName = regName;
-                mapping.bitWidth = 32;
+                // 从实际寄存器信号获取位宽
+                auto it = signalMap.find(regName);
+                if (it != signalMap.end()) {
+                  mapping.bitWidth = getSignalBitWidth(it->second);
+                } else {
+                  mapping.bitWidth = 32;  // 默认
+                }
                 mapping.isWritable = true;
                 mapping.isReadable = true;
                 mappings.push_back(mapping);
@@ -1757,7 +2435,13 @@ void extractAPBRegisterMappings(ModuleOp mod,
         APBRegisterMapping mapping;
         mapping.address = byteAddr;
         mapping.registerName = regName;
-        mapping.bitWidth = 32;
+        // 从实际寄存器信号获取位宽
+        auto it = signalMap.find(regName);
+        if (it != signalMap.end()) {
+          mapping.bitWidth = getSignalBitWidth(it->second);
+        } else {
+          mapping.bitWidth = 32;  // 默认
+        }
         mapping.isWritable = false;  // 只读
         mapping.isReadable = true;
         mappings.push_back(mapping);
@@ -1767,6 +2451,42 @@ void extractAPBRegisterMappings(ModuleOp mod,
 
     llvm::errs() << "[DEBUG] APB Read extraction: found " << prdataDrvCount
                  << " prdata drives, extracted " << readExtractedCount << " read-only mappings\n";
+
+    // ========================================================================
+    // Step 1-4: WEN 信号追踪（补充检测非时钟触发的寄存器写入）
+    // ========================================================================
+    llvm::errs() << "[WEN-TRACK] Starting WEN signal tracking...\n";
+
+    std::vector<WenTriggeredWrite> wenWrites;
+    std::vector<WenAddressMapping> wenAddrs;
+
+    // Step 1 & 2: 找到所有非时钟触发的 process，提取 wen → register 映射
+    hwMod.walk([&](llhd::ProcessOp proc) {
+      if (!isClockTriggeredProcess(proc)) {
+        extractWenTriggeredWrites(proc, wenWrites);
+      }
+    });
+
+    llvm::errs() << "[WEN-TRACK] Found " << wenWrites.size()
+                 << " WEN-triggered register writes\n";
+    for (const auto &w : wenWrites) {
+      llvm::errs() << "[WEN-TRACK]   " << w.wenSignal << " -> " << w.targetRegister << "\n";
+    }
+
+    // Step 3: 追踪 wen 信号的地址条件
+    if (!wenWrites.empty()) {
+      extractWenAddressMappings(hwMod, wenWrites, wenAddrs);
+      llvm::errs() << "[WEN-TRACK] Found " << wenAddrs.size()
+                   << " WEN address mappings\n";
+    }
+
+    // Step 4: 合并映射
+    if (!wenWrites.empty() && !wenAddrs.empty()) {
+      size_t beforeMerge = mappings.size();
+      mergeWenMappings(wenWrites, wenAddrs, mappings);
+      llvm::errs() << "[WEN-TRACK] Added " << (mappings.size() - beforeMerge)
+                   << " new APB register mappings from WEN tracking\n";
+    }
   });
 
   // 方案2：基于使用模式过滤内部信号（不依赖名字）
@@ -1818,10 +2538,26 @@ void extractAPBRegisterMappings(ModuleOp mod,
   // 应用过滤
   // 注意：只过滤可写寄存器中的内部信号
   // 只读寄存器（如状态寄存器）即使被内部逻辑写入，也是合法的APB可读寄存器
+  // 在过滤之前，收集有冲突的地址（同一地址有多个寄存器）
+  std::map<uint32_t, int> addressCount;
+  for (const auto &m : mappings) {
+    addressCount[m.address]++;
+  }
+  std::set<uint32_t> conflictAddresses;
+  for (const auto &ac : addressCount) {
+    if (ac.second > 1) {
+      conflictAddresses.insert(ac.first);
+    }
+  }
+
   size_t beforeFilter = mappings.size();
   mappings.erase(
     std::remove_if(mappings.begin(), mappings.end(),
       [&](const APBRegisterMapping &m) {
+        // 不过滤有地址冲突的寄存器（需要特殊处理）
+        if (conflictAddresses.count(m.address)) {
+          return false;
+        }
         // 只读寄存器不过滤（它们是硬件状态寄存器，通过APB可读）
         if (m.isReadable && !m.isWritable) {
           return false;

@@ -152,7 +152,36 @@ struct APBRegisterMapping {
   bool isWritable;             // 是否可写（有 APB write 条件）
   bool isReadable;             // 是否可读（有 APB read 条件）
 
-  APBRegisterMapping() : address(0), bitWidth(32), isWritable(false), isReadable(true) {}
+  // 写入特征（用于地址冲突处理）
+  bool writeUsesExtract;       // 写入值是否使用 extract(pwdata, bit)
+  int writeExtractBit;         // 如果 writeUsesExtract，提取的起始位
+  bool isW1C;                  // 是否是 Write-1-to-Clear 模式
+
+  APBRegisterMapping()
+      : address(0), bitWidth(32), isWritable(false), isReadable(true),
+        writeUsesExtract(false), writeExtractBit(0), isW1C(false) {}
+};
+
+/// 地址冲突信息
+struct AddressConflict {
+  uint32_t address;                              // 冲突的地址
+  std::vector<std::string> registerNames;        // 该地址上的所有寄存器名
+  std::vector<int> bitWidths;                    // 各寄存器的位宽
+  std::vector<bool> isReadable;                  // 各寄存器是否可读
+  std::vector<bool> isWritable;                  // 各寄存器是否可写
+  std::vector<bool> writeUsesExtract;            // 各寄存器写入是否使用 extract
+  std::vector<int> writeExtractBits;             // 各寄存器的 extract 起始位
+
+  /// 推荐的处理模式
+  enum class ResolveMode {
+    BIT_FIELD,        // 方式1: 位域提取（不同位有不同功能）
+    READ_WRITE_ASYM,  // 方式2: 读写不对称（读返回一个值，写影响另一个）
+    COMBINED,         // 混合模式
+    UNKNOWN           // 无法自动判断
+  };
+  ResolveMode recommendedMode;
+
+  AddressConflict() : address(0), recommendedMode(ResolveMode::UNKNOWN) {}
 };
 
 /// 组合逻辑赋值（process 外部的 llhd.drv）
@@ -177,6 +206,7 @@ struct ModuleAnalysisResult {
   std::vector<ControlRelation> controlRelations;  // 控制信号关系
   std::vector<APBRegisterMapping> apbMappings;  // APB 寄存器地址映射
   std::vector<CombinationalAssignment> combinationalLogic;  // 组合逻辑赋值
+  std::vector<AddressConflict> addressConflicts;  // 地址冲突信息
 };
 
 /// 分析 LLHD 模块，返回信号分类结果
