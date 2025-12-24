@@ -16,9 +16,9 @@
 
 ### 寄存器映射
 
-**总计**: 11 个寄存器 (覆盖率 91.7%)
+**总计**: 12 个寄存器 (覆盖率 100%)
 
-#### 可读写寄存器 (7 个)
+#### 可读写寄存器 (8 个)
 | 地址 | 寄存器名 | 功能 |
 |------|----------|------|
 | 0x00 | gpio_sw_data | GPIO 数据寄存器 |
@@ -27,7 +27,8 @@
 | 0x34 | gpio_int_mask | 中断屏蔽 |
 | 0x38 | gpio_int_type | 中断类型 (边沿/电平) |
 | 0x3c | gpio_int_pol | 中断极性 |
-| 0x60 | gpio_int_level_sync | 中断电平同步 |
+| 0x60 | gpio_int_level_sync | 中断电平同步 (bit 0) |
+| 0x60 | gpio_int_clr | 中断清除 (W1C) |
 
 #### 只读寄存器 (4 个)
 | 地址 | 寄存器名 | 功能 |
@@ -39,8 +40,8 @@
 
 ### MMIO 函数
 
-- **gpio_top_read()**: 11 个 case (7 可读写 + 4 只读)
-- **gpio_top_write()**: 7 个 case (只有可写寄存器)
+- **gpio_top_read()**: 11 个 case (0x60 读取 gpio_int_level_sync)
+- **gpio_top_write()**: 7 个 case + 1 个冲突地址 (0x60 同时写入 gpio_int_level_sync 和清除 gpio_int_status)
 
 ---
 
@@ -144,7 +145,7 @@ static void gpio_top_reset(DeviceState *dev);
 ### 信号类型分析框架（纯功能分析，不依赖名字）
 
 1. **方案1 - 拓扑角色分析** (`analyzeSignalRole`)
-   - 分析信号在拓扑中的角色（ModuleInput, ControlFlow, AddressSelector, DataTransfer, IntermediateValue）
+   - 分析信号在拓扑中的角色（ModuleInput, ControlFlow, AddressSelector, DataTransfer, InternalIntermediate）
    - 不依赖信号名字，只检查信号的使用方式
 
 2. **方案2 - 使用模式识别**
@@ -174,26 +175,37 @@ static void gpio_top_reset(DeviceState *dev);
 ### 代码质量
 
 - 0 个内部信号泄漏 (100% 过滤)
-- 11 个真实寄存器
+- 12 个真实寄存器 (含地址冲突处理)
 - 正确的读写权限
 - 准确的地址映射
 - 完整的事件处理
+- W1C 模式支持 (gpio_int_clr)
 
 ---
 
-## 已知问题
+## 地址冲突处理
 
-### 1. 地址冲突
+### 地址 0x60 冲突
 
-**问题**: gpio_int_clr 与 gpio_int_level_sync 共享地址 0x60
+**背景**: gpio_int_clr 与 gpio_int_level_sync 共享地址 0x60
 
 **原因**: LLHD IR 中两个寄存器使用相同的 APB 地址
-- gpio_int_level_sync (i1) 使用 pwdata[0]
-- gpio_int_clr (i32) 使用完整 pwdata
+- gpio_int_level_sync (i1) 使用 pwdata[0] (1位)
+- gpio_int_clr (i32) 使用完整 pwdata (32位)
 
-**当前处理**: 只保留 gpio_int_level_sync
+**解决方案**: BIT_FIELD 模式
+- 读取: 返回 gpio_int_level_sync
+- 写入: 同时执行两个操作
+  - `gpio_int_level_sync = value & 1` (提取 bit 0)
+  - `gpio_int_status &= ~value` (W1C 清除中断)
 
-**建议**: 查看原始 Verilog 设计意图
+**实现代码**:
+```c
+case 0x60:  /* CONFLICT: gpio_int_level_sync + gpio_int_clr */
+    s->gpio_int_level_sync = value & 1;  /* 1-bit */
+    s->gpio_int_status &= ~value;  /* W1C */
+    break;
+```
 
 ---
 
@@ -201,16 +213,16 @@ static void gpio_top_reset(DeviceState *dev);
 
 ### 代码规模
 - MMIO Read cases: 11 个
-- MMIO Write cases: 7 个
-- 事件处理器: 2 个
+- MMIO Write cases: 8 个 (含冲突地址)
+- 事件处理器: 2 个 (presetn, gpio_int_level_sync)
 
 ### 对比之前的实现
 | 指标 | 之前 | 现在 | 改进 |
 |------|------|------|------|
-| case 总数 | 125 | 18 | -85.6% |
+| case 总数 | 125 | 19 | -84.8% |
 | 内部信号 | 80+ | 0 | -100% |
 | 只读寄存器 | 0 | 4 | +400% |
-| 寄存器覆盖率 | 58.3% | 91.7% | +33.4% |
+| 寄存器覆盖率 | 58.3% | 100% | +41.7% |
 
 ---
 
@@ -227,6 +239,6 @@ static void gpio_top_reset(DeviceState *dev);
 
 ---
 
-**生成时间**: 2025-12-23
+**生成时间**: 2025-12-24
 **工具版本**: dff-opt (LLHD to QEMU Converter)
-**覆盖率**: 91.7% (11/12 寄存器)
+**覆盖率**: 100% (12/12 寄存器)
