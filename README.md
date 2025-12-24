@@ -905,7 +905,7 @@ SignalTypeByDataFlow inferSignalTypeByDataFlow(
     mlir::Value signal, hw::HWModuleOp moduleOp, llhd::ProcessOp processOp);
 ```
 
-**相关代码**: [SignalTracing.h:1214-1650](src/lib/SignalTracing.h#L1214-L1650)
+**相关代码**: [SignalTracing.h:1214-1654](src/lib/SignalTracing.h#L1214-L1654)
 
 ### 10. 输入信号注释标注不完整
 
@@ -1301,7 +1301,7 @@ qemu-output/
        │
        ├── 用于 drv 的 value？ ────────→ DataTransfer
        │
-       └── 既被 drv 写也被 prb 读？ ───→ IntermediateValue
+       └── 既被 drv 写也被 prb 读？ ───→ InternalIntermediate
 ```
 
 **用途**：快速过滤明显不是寄存器的信号（如纯控制流信号）
