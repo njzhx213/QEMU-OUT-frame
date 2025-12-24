@@ -25,12 +25,17 @@ static void gpio_top_timer_tick(void *opaque)
 
 /*
  * Update State - recalculate combinational logic after input changes
- * TODO: Generate from Signal Tracing results
+ * Auto-generated from LLHD combinational drv operations
  */
 static void gpio_top_update_state(gpio_top_state *s)
 {
-    /* Combinational logic: gpio_ext_porta -> int_level -> gpio_int_status */
-    /* TODO: Add traced combinational expressions here */
+    /* Combinational logic assignments */
+    s->zero_value = 0;
+    s->gpio_int_clk_en_tmp = ((s->int_clk_en) != (0));
+    s->int_edge = (s->int_level) ^ (s->int_level_ff1);
+    s->gpio_int_flag_tmp = ((s->gpio_int_status) != (0));
+    s->int_level = ((s->gpio_int_level_sync) ? (s->SUPPORT_INT_LEVEL_SYNC_PROC_int_level_sync_in_ff2) : (s->int_level_sync_in));
+    s->gpio_ext_data_tmp = s->gpio_rx_data;
 
     /* Update interrupt output */
     uint32_t pending = s->gpio_int_status & s->gpio_int_en & ~s->gpio_int_mask;

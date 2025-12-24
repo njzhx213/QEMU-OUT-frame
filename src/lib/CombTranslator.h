@@ -150,6 +150,21 @@ inline BitExtractPattern detectBitExtractPattern(mlir::Value val) {
   return BitExtractPattern::none();
 }
 
+/// 清洗信号名（将 . 等无效字符替换为 _）
+inline std::string sanitizeSignalName(const std::string &name) {
+  std::string result = name;
+  for (char &c : result) {
+    if (c == '.' || c == '[' || c == ']' || c == '-' || c == ' ') {
+      c = '_';
+    }
+  }
+  // 确保不以数字开头
+  if (!result.empty() && std::isdigit(static_cast<unsigned char>(result[0]))) {
+    result = "_" + result;
+  }
+  return result;
+}
+
 /// 获取信号名称（穿透 llhd.prb）
 inline std::string getSignalName(mlir::Value val) {
   // 直接是 llhd.prb
@@ -157,12 +172,12 @@ inline std::string getSignalName(mlir::Value val) {
     mlir::Value sig = prbOp.getSignal();
     if (auto sigOp = sig.getDefiningOp()) {
       if (auto nameAttr = sigOp->getAttrOfType<mlir::StringAttr>("name")) {
-        return "s->" + nameAttr.getValue().str();
+        return "s->" + sanitizeSignalName(nameAttr.getValue().str());
       }
       // 使用 SSA 名称作为后备
       std::string ssaName = getSSANameFromValue(sig);
       if (!ssaName.empty()) {
-        return "s->" + ssaName;
+        return "s->" + sanitizeSignalName(ssaName);
       }
     }
     return "s->unnamed";
@@ -450,8 +465,8 @@ inline TranslateResult translateValue(mlir::Value val, unsigned maxDepth = 10) {
       auto cond = translateValue(muxOp.getCond(), maxDepth - 1);
       if (!cond.success) return cond;
       return TranslateResult::ok("((" + cond.expr + ") ? (s->" +
-                                  truePattern.signalName + ") : (s->" +
-                                  falsePattern.signalName + "))");
+                                  sanitizeSignalName(truePattern.signalName) + ") : (s->" +
+                                  sanitizeSignalName(falsePattern.signalName) + "))");
     }
 
     auto cond = translateValue(muxOp.getCond(), maxDepth - 1);

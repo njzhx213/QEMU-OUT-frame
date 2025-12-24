@@ -75,6 +75,9 @@ public:
   /// 设置 APB 寄存器映射
   void setAPBMappings(const std::vector<clk_analysis::APBRegisterMapping> &mappings);
 
+  /// 设置组合逻辑赋值
+  void setCombinationalLogic(const std::vector<clk_analysis::CombinationalAssignment> &logic);
+
   /// 生成 QEMU 设备头文件
   void generateHeader(llvm::raw_ostream &os);
 
@@ -91,6 +94,7 @@ private:
   std::vector<std::pair<std::string, int>> gpioInputSignals_;  // GPIO 外部输入
   std::map<std::string, std::string> inputSignalTypes_;  // 输入信号分类
   std::vector<clk_analysis::APBRegisterMapping> apbMappings_;  // APB 寄存器映射
+  std::vector<clk_analysis::CombinationalAssignment> combinationalLogic_;  // 组合逻辑
 
   /// 生成 ptimer 回调函数
   void generatePtimerCallback(llvm::raw_ostream &os);

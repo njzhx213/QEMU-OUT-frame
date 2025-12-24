@@ -276,6 +276,18 @@ int main(int argc, char **argv) {
     // 设置 APB 寄存器映射
     gen.setAPBMappings(analysisResult.apbMappings);
 
+    // 设置组合逻辑赋值
+    gen.setCombinationalLogic(analysisResult.combinationalLogic);
+
+    // 打印组合逻辑信息
+    if (!analysisResult.combinationalLogic.empty()) {
+      llvm::outs() << "\nCombinational Logic (" << analysisResult.combinationalLogic.size() << " assignments):\n";
+      for (const auto &assign : analysisResult.combinationalLogic) {
+        llvm::outs() << "  - " << assign.targetSignal << " = " << assign.expression << "\n";
+      }
+      llvm::outs() << "\n";
+    }
+
     // 生成代码
     if (!qemuOutputDir.empty()) {
       // 输出到文件

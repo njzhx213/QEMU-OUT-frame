@@ -5,6 +5,36 @@
 
 ## 更新日志
 
+### 2025-12-24
+
+**解决的问题：**
+- ✅ **Issue #8 解决** - `update_state()` 组合逻辑自动生成
+
+**新增功能：**
+1. **组合逻辑自动提取**: 从 LLHD IR 中提取 `llhd.process` 外的 `llhd.drv` 操作
+   - 纯结构分析：检查 drv 是否在 process 内部
+   - 无名字匹配：不依赖信号名后缀或前缀
+
+2. **CombTranslator 信号名清洗**: 添加 `sanitizeSignalName()` 函数
+   - 将 `.` 等无效 C 标识符字符替换为 `_`
+   - 确保头文件定义与表达式引用一致
+
+3. **新数据结构**: `CombinationalAssignment` 存储组合逻辑赋值
+   - `targetSignal`: 目标信号名
+   - `expression`: C 表达式字符串
+   - `bitWidth`: 信号位宽
+
+**生成结果**: 6 个组合逻辑赋值自动提取
+```c
+s->int_level = ((s->gpio_int_level_sync) ?
+    (s->SUPPORT_INT_LEVEL_SYNC_PROC_int_level_sync_in_ff2) :
+    (s->int_level_sync_in));
+s->int_edge = (s->int_level) ^ (s->int_level_ff1);
+// ... 等
+```
+
+---
+
 ### 2025-12-23
 
 **解决的问题：**
@@ -375,36 +405,62 @@ bool isGPIOInputByDataFlow(mlir::Value signal, hw::HWModuleOp moduleOp) {
 - 2025-12-17: 使用 SignalTracing 库重写 APB 映射提取
 - 2025-12-22: 添加只读寄存器提取，修复地址符号扩展 bug
 
-### 8. Signal Tracing / update_state 组合逻辑生成 【进行中】
+### ~~8. Signal Tracing / update_state 组合逻辑生成~~ 【✅ 已解决 2025-12-24】
 
-`generateUpdateState()` 函数当前生成的是硬编码的占位符代码：
+#### 问题描述
+`generateUpdateState()` 函数原本生成的是硬编码的占位符代码，组合逻辑需要手动填写。
 
+#### 解决方案
+
+**核心思路**: 纯结构分析 —— 在 `llhd.process` 外部的 `llhd.drv` 操作就是组合逻辑。
+
+**实现步骤**:
+1. **识别组合逻辑**: 检查 `llhd.drv` 是否在 `llhd.process` 内部
+   ```cpp
+   Operation *parent = drv->getParentOp();
+   while (parent && !isa<llhd::ProcessOp>(parent) && !isa<hw::HWModuleOp>(parent)) {
+     parent = parent->getParentOp();
+   }
+   if (isa<llhd::ProcessOp>(parent)) return;  // 跳过 process 内的
+   ```
+
+2. **表达式翻译**: 使用 `CombTranslator` 将 comb 操作转换为 C 表达式
+   - 递归追踪 def-use 链
+   - 支持所有 comb dialect 操作 (and, or, xor, mux, extract, concat 等)
+
+3. **信号名清洗**: `sanitizeSignalName()` 将 `.` 替换为 `_`
+
+**生成结果** (GPIO 模块提取到 6 个组合逻辑赋值):
 ```c
 static void gpio_top_update_state(gpio_top_state *s)
 {
-    /* Combinational logic: gpio_ext_porta -> int_level -> gpio_int_status */
-    /* TODO: Add traced combinational expressions here */
+    /* Combinational logic assignments */
+    s->zero_value = 0;
+    s->gpio_int_clk_en_tmp = ((s->int_clk_en) != (0));
+    s->int_edge = (s->int_level) ^ (s->int_level_ff1);
+    s->gpio_int_flag_tmp = ((s->gpio_int_status) != (0));
+    s->int_level = ((s->gpio_int_level_sync) ?
+        (s->SUPPORT_INT_LEVEL_SYNC_PROC_int_level_sync_in_ff2) :
+        (s->int_level_sync_in));
+    s->gpio_ext_data_tmp = s->gpio_rx_data;
 
     /* Update interrupt output */
     uint32_t pending = s->gpio_int_status & s->gpio_int_en & ~s->gpio_int_mask;
-    // ...
+    ...
 }
 ```
 
-**问题**: 组合逻辑部分（从 `gpio_ext_porta` 到 `int_level` 到 `gpio_int_status` 的信号传播）需要从 LLHD IR 自动追踪生成。
+**修改的文件**:
+- `ClkAnalysisResult.h`: 新增 `CombinationalAssignment` 结构体
+- `ClkAnalysisResult.cpp`: 收集 process 外的 drv 操作
+- `CombTranslator.h`: 新增 `sanitizeSignalName()` 函数
+- `QEMUCodeGen.h/cpp`: 新增 `setCombinationalLogic()` 和修改 `generateUpdateState()`
+- `tool_main.cpp`: 调用 `setCombinationalLogic()`
 
-**需要实现**:
-1. 从 GPIO 输入信号开始，追踪所有依赖的组合逻辑链
-2. 生成正确的信号传播表达式到 `update_state()` 函数
-3. 确保中断状态正确更新
-
-**进展** (2025-12-23):
-- ✅ 时钟/复位信号纯功能区分已实现 - 基于触发效果分析，不再依赖信号名
-- ✅ 新增 `TriggerBranchEffect` 和 `analyzeTriggerBranchEffects()` 用于分析触发分支效果
-- ✅ `isDrvHoldPattern()` 可检测 hold 模式 drv 操作
-- 🔄 下一步：利用这些基础设施追踪组合逻辑链并生成表达式
-
-**相关代码**: [QEMUCodeGen.cpp:841-861](src/lib/QEMUCodeGen.cpp#L841-L861)
+**相关代码**:
+- [ClkAnalysisResult.cpp:574-667](src/lib/ClkAnalysisResult.cpp#L574-L667) - 组合逻辑收集
+- [CombTranslator.h:153-166](src/lib/CombTranslator.h#L153-L166) - 信号名清洗
+- [QEMUCodeGen.cpp:984-1016](src/lib/QEMUCodeGen.cpp#L984-L1016) - update_state 生成
 
 ### ~~9. 输入信号数据流分析缺失~~ 【✅ 已解决 2025-12-23】
 

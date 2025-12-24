@@ -62,6 +62,10 @@ void QEMUDeviceGenerator::setAPBMappings(const std::vector<clk_analysis::APBRegi
   apbMappings_ = mappings;
 }
 
+void QEMUDeviceGenerator::setCombinationalLogic(const std::vector<clk_analysis::CombinationalAssignment> &logic) {
+  combinationalLogic_ = logic;
+}
+
 void QEMUDeviceGenerator::generateHeader(llvm::raw_ostream &os) {
   std::string upperName = toUpperCase(deviceName_);
 
@@ -982,13 +986,25 @@ void QEMUDeviceGenerator::generateUpdateState(llvm::raw_ostream &os) {
 
   os << "/*\n";
   os << " * Update State - recalculate combinational logic after input changes\n";
-  os << " * TODO: Generate from Signal Tracing results\n";
+  os << " * Auto-generated from LLHD combinational drv operations\n";
   os << " */\n";
   os << "static void " << deviceName_ << "_update_state(" << deviceName_ << "_state *s)\n";
   os << "{\n";
-  os << "    /* Combinational logic: gpio_ext_porta -> int_level -> gpio_int_status */\n";
-  os << "    /* TODO: Add traced combinational expressions here */\n";
-  os << "\n";
+
+  // 输出组合逻辑赋值
+  if (!combinationalLogic_.empty()) {
+    os << "    /* Combinational logic assignments */\n";
+    for (const auto &assign : combinationalLogic_) {
+      std::string sanitizedTarget = sanitizeName(assign.targetSignal);
+      os << "    s->" << sanitizedTarget << " = " << assign.expression << ";\n";
+    }
+    os << "\n";
+  } else {
+    os << "    /* No combinational logic extracted */\n";
+    os << "    /* TODO: Add traced combinational expressions here if needed */\n";
+    os << "\n";
+  }
+
   os << "    /* Update interrupt output */\n";
   os << "    uint32_t pending = s->gpio_int_status & s->gpio_int_en & ~s->gpio_int_mask;\n";
   os << "    if (pending) {\n";

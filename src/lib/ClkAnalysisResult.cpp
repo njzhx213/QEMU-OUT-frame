@@ -573,6 +573,12 @@ ModuleAnalysisResult analyzeModule(mlir::ModuleOp mod) {
 
     // 处理 process 外部的 drv 操作（组合逻辑）
     // 这些 drv 不在任何 process 内部
+    // 收集模块端口名，用于过滤
+    llvm::StringSet<> modulePortNames;
+    for (auto port : hwMod.getPortList()) {
+      modulePortNames.insert(port.getName());
+    }
+
     hwMod.walk([&](llhd::DrvOp drv) {
       // 检查是否在 process 内部
       Operation *parent = drv->getParentOp();
@@ -612,6 +618,52 @@ ModuleAnalysisResult analyzeModule(mlir::ModuleOp mod) {
       }
 
       signalMap[sigName] = sigResult;
+
+      // ========== 收集组合逻辑赋值（用于 update_state） ==========
+      // 过滤条件：
+      // 1. 不是模块端口（输入/输出端口由 MMIO 或 GPIO 回调处理）
+      // 2. 不是复杂表达式（能够生成有效的 C 代码）
+      // 3. 信号名不以常见的内部中间信号前缀开头
+
+      // 检查是否是模块端口
+      if (modulePortNames.contains(sigName)) {
+        return;
+      }
+
+      // 检查是否能生成有效表达式
+      if (isComplexAction(action)) {
+        return;
+      }
+
+      // 生成表达式
+      std::string expr;
+      switch (action.type) {
+        case ActionType::ASSIGN_CONST:
+          expr = std::to_string(action.constValue);
+          break;
+        case ActionType::ASSIGN_SIGNAL:
+          expr = "s->" + action.sourceSignal;
+          break;
+        case ActionType::COMPUTE:
+          // action.expression 格式是 "target = expr"，提取 expr 部分
+          if (action.expression.find(" = ") != std::string::npos) {
+            expr = action.expression.substr(action.expression.find(" = ") + 3);
+          } else {
+            expr = action.expression;
+          }
+          break;
+        default:
+          return;  // 其他类型暂不处理
+      }
+
+      // 添加到组合逻辑列表
+      if (!expr.empty()) {
+        CombinationalAssignment combAssign;
+        combAssign.targetSignal = sigName;
+        combAssign.expression = expr;
+        combAssign.bitWidth = sigResult.bitWidth;
+        result.combinationalLogic.push_back(combAssign);
+      }
     });
   });
 

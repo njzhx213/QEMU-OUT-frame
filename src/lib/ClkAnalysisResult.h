@@ -155,6 +155,18 @@ struct APBRegisterMapping {
   APBRegisterMapping() : address(0), bitWidth(32), isWritable(false), isReadable(true) {}
 };
 
+/// 组合逻辑赋值（process 外部的 llhd.drv）
+/// 用于生成 update_state() 函数中的组合逻辑表达式
+struct CombinationalAssignment {
+  std::string targetSignal;    // 目标信号名
+  std::string expression;      // C 表达式字符串
+  int bitWidth;                // 信号位宽
+
+  CombinationalAssignment() : bitWidth(32) {}
+  CombinationalAssignment(const std::string &target, const std::string &expr, int width)
+      : targetSignal(target), expression(expr), bitWidth(width) {}
+};
+
 /// 模块分析结果
 struct ModuleAnalysisResult {
   std::string moduleName;
@@ -164,6 +176,7 @@ struct ModuleAnalysisResult {
   std::vector<DerivedSignal> derivedSignals;  // 派生信号列表
   std::vector<ControlRelation> controlRelations;  // 控制信号关系
   std::vector<APBRegisterMapping> apbMappings;  // APB 寄存器地址映射
+  std::vector<CombinationalAssignment> combinationalLogic;  // 组合逻辑赋值
 };
 
 /// 分析 LLHD 模块，返回信号分类结果
