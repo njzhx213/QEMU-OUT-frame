@@ -157,132 +157,125 @@ s->int_edge = (s->int_level) ^ (s->int_level_ff1);
    | W1C 字段 (名字含 `clr`) | `s->status_reg &= ~value;` |
    | 普通 32-bit | `s->field = value;` |
 
-   **四步解决方案流程图：**
+   **四步解决方案：**
 
-   ```
-   ┌─────────────────────────────────────────────────────────────┐
-   │                    Step 1: 冲突检测                          │
-   │  ┌─────────────────────────────────────────────────────┐    │
-   │  │ 遍历所有 APB 寄存器映射，按地址分组                    │    │
-   │  │ addressToRegs[0x60] = {gpio_int_level_sync, gpio_int_clr}│
-   │  └─────────────────────────────────────────────────────┘    │
-   └────────────────────────┬────────────────────────────────────┘
-                            │
-                            ▼
-   ┌─────────────────────────────────────────────────────────────┐
-   │                    Step 2: Case 分类                         │
-   │  ┌─────────────────────────────────────────────────────┐    │
-   │  │ 分析每个寄存器的特征：                                │    │
-   │  │ - gpio_int_level_sync: 1-bit, isWritable=true         │    │
-   │  │ - gpio_int_clr: 32-bit, 数据流为 W1C 模式             │    │
-   │  │                                                       │    │
-   │  │ 判定: 位宽不同 + 行为不同 → BIT_FIELD 模式             │    │
-   │  └─────────────────────────────────────────────────────┘    │
-   └────────────────────────┬────────────────────────────────────┘
-                            │
-                            ▼
-   ┌─────────────────────────────────────────────────────────────┐
-   │                    Step 3: 代码生成                          │
-   │  ┌─────────────────────────────────────────────────────┐    │
-   │  │ BIT_FIELD 模式生成:                                   │    │
-   │  │                                                       │    │
-   │  │ case 0x60:  /* CONFLICT: gpio_int_level_sync + ...*/  │    │
-   │  │     s->gpio_int_level_sync = value & 1;  // 1-bit     │    │
-   │  │     s->gpio_int_status &= ~value;        // W1C       │    │
-   │  │     break;                                            │    │
-   │  └─────────────────────────────────────────────────────┘    │
-   └────────────────────────┬────────────────────────────────────┘
-                            │
-                            ▼
-   ┌─────────────────────────────────────────────────────────────┐
-   │                    Step 4: 功能追踪验证                       │
-   │  ┌─────────────────────────────────────────────────────┐    │
-   │  │ generateActionCode() 使用 signalExists() 检查        │    │
-   │  │                                                       │    │
-   │  │ // 功能追踪：检查目标信号是否在状态结构体中定义         │    │
-   │  │ if (!signalExists(action.targetSignal)) {            │    │
-   │  │     return;  // 跳过未定义信号（如 APB 输出 prdata）   │    │
-   │  │ }                                                     │    │
-   │  │                                                       │    │
-   │  │ signalExists() 检查: signals_ ∪ inputSignals_ ∪       │    │
-   │  │                       derivedSignals_                 │    │
-   │  └─────────────────────────────────────────────────────┘    │
-   └─────────────────────────────────────────────────────────────┘
-   ```
+   ---
 
-   **检测逻辑** (`QEMUCodeGen.cpp:generateMMIOWrite`):
+   **Step 1: 冲突检测**
+
+   遍历所有 APB 寄存器映射，按地址分组，检测同地址多寄存器：
+
    ```cpp
-   // 按地址分组寄存器
+   // QEMUCodeGen.cpp - 按地址分组
    std::map<uint64_t, std::vector<APBRegisterMapping>> addrToRegs;
    for (const auto &mapping : apbMappings_) {
-       if (mapping.isWritable) {
-           addrToRegs[mapping.address].push_back(mapping);
-       }
+       addrToRegs[mapping.address].push_back(mapping);
    }
 
-   // 检测地址冲突
+   // 检测冲突
    for (const auto &[addr, regs] : addrToRegs) {
        if (regs.size() > 1) {
-           // BIT_FIELD 模式：生成合并的 case
-           os << "    case 0x" << llvm::format_hex_no_prefix(addr, 2)
-              << ":  /* CONFLICT: ";
-           for (size_t i = 0; i < regs.size(); i++) {
-               os << regs[i].registerName;
-               if (i < regs.size() - 1) os << " + ";
-           }
-           os << " */\n";
-
-           // 为每个寄存器生成对应的写入逻辑
-           for (const auto &reg : regs) {
-               if (reg.bitWidth == 1) {
-                   os << "        s->" << reg.registerName << " = value & 1;\n";
-               } else if (isW1CRegister(reg)) {
-                   os << "        s->gpio_int_status &= ~value;  /* W1C */\n";
-               }
-           }
+           // 发现地址冲突！
+           // addressToRegs[0x60] = {gpio_int_level_sync, gpio_int_clr}
        }
    }
    ```
 
-   **功能追踪修复** (`QEMUCodeGen.cpp:generateActionCode`):
+   ---
+
+   **Step 2: Case 分类**
+
+   分析同地址寄存器的特征，判定属于哪种模式：
+
+   ```
+   gpio_int_level_sync:  1-bit,  R/W 普通读写
+   gpio_int_clr:         32-bit, W1C 写1清除
+                              │
+                              ▼
+   位宽不同 + 行为不同 ──────→ BIT_FIELD 模式
+   ```
+
+   分类规则：
+   | 条件 | 模式 |
+   |------|------|
+   | 位宽不同 或 读写行为不同 | BIT_FIELD |
+   | 位宽相同 且 无法区分 | INDEPENDENT（需手动处理）|
+
+   ---
+
+   **Step 3: 代码生成**
+
+   根据模式生成对应的 MMIO 代码：
+
    ```cpp
-   void QEMUDeviceGenerator::generateActionCode(...) {
-       // 使用功能追踪而非名字匹配
-       // 检查目标信号是否在状态结构体中定义
-       if (!signalExists(action.targetSignal)) {
-           return;  // 跳过 APB 输出信号等未定义信号
+   // QEMUCodeGen.cpp - BIT_FIELD 模式生成
+   if (regs.size() > 1) {
+       os << "case 0x" << addr << ":  /* CONFLICT: ... */\n";
+       for (const auto &reg : regs) {
+           if (reg.bitWidth == 1) {
+               // 1-bit 字段：取最低位
+               os << "    s->" << reg.name << " = value & 1;\n";
+           } else if (isW1CRegister(reg)) {
+               // W1C 字段：写1清除状态寄存器对应位
+               os << "    s->gpio_int_status &= ~value;\n";
+           } else {
+               // 普通字段
+               os << "    s->" << reg.name << " = value;\n";
+           }
        }
-       // ... 生成代码
+       os << "    break;\n";
+   }
+   ```
+
+   **生成结果**：
+   ```c
+   // Write handler
+   case 0x60:  /* CONFLICT: gpio_int_level_sync + gpio_int_clr */
+       s->gpio_int_level_sync = value & 1;  /* 1-bit R/W */
+       s->gpio_int_status &= ~value;        /* W1C */
+       break;
+
+   // Read handler
+   case 0x60:
+       value = s->gpio_int_level_sync;      /* 只读主寄存器 */
+       break;
+   ```
+
+   ---
+
+   **Step 4: 功能追踪验证**
+
+   使用 `signalExists()` 检查目标信号是否在状态结构体中定义，避免引用未定义信号：
+
+   ```cpp
+   // QEMUCodeGen.cpp - generateActionCode()
+   void generateActionCode(const EventAction &action) {
+       // 功能追踪：检查信号是否存在
+       if (!signalExists(action.targetSignal)) {
+           return;  // 跳过未定义信号（如 prdata）
+       }
+       // 生成代码...
    }
 
-   bool QEMUDeviceGenerator::signalExists(const std::string &name) {
-       // 检查信号是否在任一集合中定义
-       for (const auto &sig : signals_) {
+   // 检查信号是否在任一集合中定义
+   bool signalExists(const std::string &name) {
+       // 检查: signals_ ∪ inputSignals_ ∪ derivedSignals_
+       for (const auto &sig : signals_)
            if (sanitizeName(sig.name) == sanitizeName(name)) return true;
-       }
-       for (const auto &[sigName, _] : inputSignals_) {
-           if (sanitizeName(sigName) == sanitizeName(name)) return true;
-       }
-       for (const auto &derived : derivedSignals_) {
-           if (sanitizeName(derived.name) == sanitizeName(name)) return true;
-       }
+       for (const auto &[n, _] : inputSignals_)
+           if (sanitizeName(n) == sanitizeName(name)) return true;
+       for (const auto &d : derivedSignals_)
+           if (sanitizeName(d.name) == sanitizeName(name)) return true;
        return false;
    }
    ```
 
-   **生成结果** (gpio0):
-   ```c
-   // Write handler - 地址冲突正确处理
-   case 0x60:  /* CONFLICT: gpio_int_level_sync + gpio_int_clr */
-       s->gpio_int_level_sync = value & 1;  /* 1-bit */
-       s->gpio_int_status &= ~value;  /* W1C */
-       break;
+   **为什么需要这一步？**
+   - APB 总线的 `prdata` 是输出信号，在 QEMU 中通过 `return value` 实现
+   - 但 LLHD IR 中可能有 `drv prdata, ...` 操作
+   - 如果不过滤，会生成 `s->prdata = ...;` 导致编译错误
 
-   // Read handler - 只读取主寄存器
-   case 0x60:
-       value = s->gpio_int_level_sync;
-       break;
-   ```
+   ---
 
 ---
 
