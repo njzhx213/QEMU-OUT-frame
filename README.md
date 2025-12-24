@@ -9,7 +9,7 @@
 
 **解决的问题：**
 - ✅ **Issue #8 解决** - `update_state()` 组合逻辑自动生成
-- ✅ **APB 时钟检测统一** - `isClockTriggeredProcess` 现在使用精确检测函数
+- ✅ **APB 时钟检测统一** - 使用 `isClockSignalByUsagePattern()` + `isClockByTriggerEffect()` 精确检测
 - ✅ **地址冲突问题解决** - 同一地址多寄存器的检测与代码生成
 - ✅ **功能追踪修复** - `generateActionCode()` 使用 `signalExists()` 替代名字匹配
 
@@ -17,12 +17,14 @@
 
 1. **WEN 信号追踪（四步法）**: 检测非时钟触发的寄存器写入
 
+   > **注意**: 以下四步法是概念性描述，实际实现均在 `extractAPBRegisterMappings()` 函数内部完成（ClkAnalysisResult.cpp:1432-1850）
+
    **流程图：**
    ```
    ┌─────────────────────────────────────────────────────────────────┐
    │                     Step 1: 时钟触发检测                         │
    │  ┌───────────────────────────────────────────────────────────┐  │
-   │  │ isClockTriggeredProcess(proc)                             │  │
+   │  │ 使用 SignalTracing.h 的检测函数:                          │  │
    │  │   ├─ isClockSignalByUsagePattern(sig, proc) // 结构特征   │  │
    │  │   └─ isClockByTriggerEffect(sig, proc)      // 触发效果   │  │
    │  │                                                           │  │
@@ -34,9 +36,9 @@
    ┌─────────────────────────────────────────────────────────────────┐
    │                     Step 2: 写入目标提取                         │
    │  ┌───────────────────────────────────────────────────────────┐  │
-   │  │ extractWenTriggeredWrites(proc)                           │  │
-   │  │   ├─ 遍历 proc 内所有 llhd.drv 操作                       │  │
-   │  │   └─ 提取: WEN 信号名 + 目标寄存器名                       │  │
+   │  │ 在 extractAPBRegisterMappings() 内:                       │  │
+   │  │   ├─ 遍历 APB 写条件的 true 分支                          │  │
+   │  │   └─ 提取: drv *_wen 操作的目标寄存器名                    │  │
    │  │                                                           │  │
    │  │ 输出: {gpio_int_clr_wen → gpio_int_clr}                   │  │
    │  └───────────────────────────────────────────────────────────┘  │
@@ -46,10 +48,10 @@
    ┌─────────────────────────────────────────────────────────────────┐
    │                     Step 3: 地址条件追踪                         │
    │  ┌───────────────────────────────────────────────────────────┐  │
-   │  │ extractWenAddressMappings(moduleOp)                       │  │
-   │  │   ├─ 查找 drv *_wen 操作                                  │  │
-   │  │   ├─ 追踪: and(psel, penable, pwrite, icmp(paddr, const)) │  │
-   │  │   └─ 提取: WEN 信号 + 地址常量                             │  │
+   │  │ 在 extractAPBRegisterMappings() 内:                       │  │
+   │  │   ├─ 递归分析控制流前驱块                                 │  │
+   │  │   ├─ 查找: icmp(extract(paddr), const) 模式               │  │
+   │  │   └─ 提取: 地址常量值                                      │  │
    │  │                                                           │  │
    │  │ 输出: {gpio_int_clr_wen → 0x60}                           │  │
    │  └───────────────────────────────────────────────────────────┘  │
@@ -59,77 +61,79 @@
    ┌─────────────────────────────────────────────────────────────────┐
    │                     Step 4: 映射合并                             │
    │  ┌───────────────────────────────────────────────────────────┐  │
-   │  │ mergeWenMappings(wenWrites, wenAddrs)                     │  │
+   │  │ 在 extractAPBRegisterMappings() 内:                       │  │
    │  │   ├─ 合并: WEN→寄存器 + WEN→地址                           │  │
-   │  │   └─ 生成: APBRegisterMapping                             │  │
+   │  │   └─ 生成: APBRegisterMapping 结构体                       │  │
    │  │                                                           │  │
    │  │ 输出: {addr=0x60, reg=gpio_int_clr, width=32, W1C=true}   │  │
    │  └───────────────────────────────────────────────────────────┘  │
    └─────────────────────────────────────────────────────────────────┘
    ```
 
-   **Step 1: `isClockTriggeredProcess()`** - 判断 process 是否时钟触发
+   **Step 1: 时钟触发检测** - 使用 SignalTracing.h 的检测函数
    ```cpp
+   // 实现位置: SignalTracing.h:897-985, 1117-1129
    // 两级检测：结构特征 + 触发效果
-   bool isClockTriggeredProcess(llhd::ProcessOp proc) {
-       for (auto sig : proc.getBody().getArguments()) {
-           // 1. 结构特征：单比特、在敏感列表、无逻辑驱动
-           if (!isClockSignalByUsagePattern(sig, proc)) continue;
-           // 2. 触发效果：所有 drv 都是 hold 模式 (reg = prb reg)
-           if (isClockByTriggerEffect(sig, proc)) return true;
+   for (auto sig : proc.getBody().getArguments()) {
+       // 1. 结构特征：单比特、在敏感列表、无逻辑驱动
+       if (!signal_tracing::isClockSignalByUsagePattern(sig, proc)) continue;
+       // 2. 触发效果：所有 drv 都是 hold 模式 (reg = prb reg)
+       if (signal_tracing::isClockByTriggerEffect(sig, proc)) {
+           isClockTriggered = true;
+           break;
        }
-       return false;
    }
    ```
 
-   **Step 2: `extractWenTriggeredWrites()`** - 提取非时钟触发 process 的写入目标
+   **Step 2: WEN 写入目标提取** - 在 `extractAPBRegisterMappings()` 内实现
    ```cpp
-   // 遍历非时钟触发 process 的所有 drv 操作
-   std::map<std::string, std::string> extractWenTriggeredWrites(ProcessOp proc) {
-       std::map<std::string, std::string> wenToReg;
-       proc.walk([&](llhd::DrvOp drv) {
-           auto wenSig = getWenSignalFromCondition(drv);  // 从条件中提取 WEN
-           auto targetReg = getTargetSignalName(drv);     // 目标寄存器
-           wenToReg[wenSig] = targetReg;
-       });
-       return wenToReg;  // {gpio_int_clr_wen → gpio_int_clr}
-   }
-   ```
-
-   **Step 3: `extractWenAddressMappings()`** - 追踪 WEN 信号的地址条件
-   ```cpp
-   // 追踪 WEN 信号的地址来源
-   std::map<std::string, uint64_t> extractWenAddressMappings(HWModuleOp mod) {
-       std::map<std::string, uint64_t> wenToAddr;
-       mod.walk([&](llhd::DrvOp drv) {
-           if (!isWenSignal(drv.getTarget())) return;
-           // 追踪: and(psel, penable, pwrite, icmp(paddr, CONST))
-           if (auto addr = traceAddressFromCondition(drv)) {
-               wenToAddr[getSignalName(drv)] = *addr;
+   // 实现位置: ClkAnalysisResult.cpp:1527-1582
+   // 遍历 APB 写条件的 true 分支，查找 drv *_wen 操作
+   hwMod.walk([&](llhd::DrvOp drv) {
+       Value target = drv.getSignal();
+       if (auto nameAttr = sigOp->getAttrOfType<StringAttr>("name")) {
+           StringRef signalName = nameAttr.getValue();
+           if (signalName.find("_wen") != StringRef::npos) {
+               // 去掉 _wen 后缀得到寄存器名
+               size_t wenPos = signalName.find("_wen");
+               regName = signalName.str().substr(0, wenPos);
            }
-       });
-       return wenToAddr;  // {gpio_int_clr_wen → 0x60}
-   }
+       }
+   });
    ```
 
-   **Step 4: `mergeWenMappings()`** - 合并映射生成 APB 寄存器信息
+   **Step 3: 地址条件追踪** - 在 `extractAPBRegisterMappings()` 内实现
    ```cpp
+   // 实现位置: ClkAnalysisResult.cpp:1485-1525
+   // 递归分析控制流，查找 icmp(extract(paddr), const) 模式
+   std::function<void(Block*, std::optional<int64_t>)> analyzeBlock =
+       [&](Block *block, std::optional<int64_t> currentAddr) {
+       // 检查前驱块中的地址检查条件
+       for (Block *pred : block->getPredecessors()) {
+           if (auto condBr = dyn_cast<cf::CondBranchOp>(pred->getTerminator())) {
+               if (auto icmp = condBr.getCondition().getDefiningOp<comb::ICmpOp>()) {
+                   // 提取地址常量
+                   if (auto constOp = icmp.getRhs().getDefiningOp<hw::ConstantOp>()) {
+                       currentAddr = constOp.getValue().getZExtValue();
+                   }
+               }
+           }
+       }
+   };
+   ```
+
+   **Step 4: 映射合并** - 在 `extractAPBRegisterMappings()` 内实现
+   ```cpp
+   // 实现位置: ClkAnalysisResult.cpp:1560-1582
    // 合并 WEN→寄存器 和 WEN→地址，生成完整的 APB 映射
-   std::vector<APBRegisterMapping> mergeWenMappings(
-       const std::map<std::string, std::string>& wenToReg,
-       const std::map<std::string, uint64_t>& wenToAddr) {
-       std::vector<APBRegisterMapping> result;
-       for (auto& [wen, reg] : wenToReg) {
-           if (wenToAddr.count(wen)) {
-               APBRegisterMapping m;
-               m.address = wenToAddr.at(wen);
-               m.registerName = reg;
-               m.bitWidth = getRegWidth(reg);
-               m.isWritable = true;
-               result.push_back(m);
-           }
-       }
-       return result;
+   if (!regName.empty() && currentAddr.has_value()) {
+       uint32_t byteAddr = static_cast<uint32_t>(*currentAddr) << 2;  // 字节地址
+       APBRegisterMapping mapping;
+       mapping.address = byteAddr;
+       mapping.registerName = regName;
+       mapping.bitWidth = 32;
+       mapping.isWritable = true;
+       mappings.push_back(mapping);
    }
    ```
 
@@ -1218,11 +1222,11 @@ qemu-output/
 │                 ▼                        │
 │  ┌─────────────────────────────────┐    │
 │  │ WEN 信号追踪（四步法）            │    │
-│  │ 1. isClockTriggeredProcess       │    │
-│  │    - 复用 isClockByTriggerEffect │    │
-│  │ 2. extractWenTriggeredWrites     │    │
-│  │ 3. extractWenAddressMappings     │    │
-│  │ 4. mergeWenMappings              │    │
+│  │ 在 extractAPBRegisterMappings() 内:│    │
+│  │ 1. 时钟触发检测 (SignalTracing)   │    │
+│  │ 2. WEN 写入目标提取              │    │
+│  │ 3. 地址条件追踪                   │    │
+│  │ 4. 映射合并生成                   │    │
 │  └─────────────────────────────────┘    │
 │                 ▼                        │
 │  ┌─────────────────────────────────┐    │
@@ -1400,23 +1404,24 @@ enum class SignalTypeByDataFlow {
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
-| SignalRole 枚举 | SignalTracing.h | 135-160 |
-| analyzeSignalRole | SignalTracing.h | 162-340 |
-| isClockSignalByUsagePattern | SignalTracing.h | 900-985 |
-| TriggerBranchEffect | SignalTracing.h | 991-1003 |
+| SignalRole 枚举 | SignalTracing.h | 136-145 |
+| analyzeSignalRole | SignalTracing.h | 337-340 |
+| isClockSignalByUsagePattern | SignalTracing.h | 897-985 |
+| TriggerBranchEffect | SignalTracing.h | 992-1003 |
 | isDrvHoldPattern | SignalTracing.h | 1007-1019 |
 | analyzeTriggerBranchEffects | SignalTracing.h | 1073-1112 |
 | isClockByTriggerEffect | SignalTracing.h | 1117-1129 |
-| inferSignalTypeByDataFlow | SignalTracing.h | 1440-1490 |
-| **WEN tracking** | | |
-| isClockTriggeredProcess | ClkAnalysisResult.cpp | 1450-1482 |
-| extractWenTriggeredWrites | ClkAnalysisResult.cpp | 1484-1580 |
-| extractWenAddressMappings | ClkAnalysisResult.cpp | 1582-1770 |
-| mergeWenMappings | ClkAnalysisResult.cpp | 1772-1825 |
+| inferSignalTypeByDataFlow | SignalTracing.h | 1608-1637 |
+| **WEN tracking (四步法均在此函数内实现)** | | |
+| extractAPBRegisterMappings | ClkAnalysisResult.cpp | 1432-1850 |
+| - 时钟触发检测 (Step 1) | ClkAnalysisResult.cpp | 1485-1525 |
+| - WEN 写入目标提取 (Step 2) | ClkAnalysisResult.cpp | 1527-1582 |
+| - 地址条件追踪 (Step 3) | ClkAnalysisResult.cpp | 1539-1547 |
+| - 映射合并 (Step 4) | ClkAnalysisResult.cpp | 1560-1582 |
 | **地址冲突处理** | | |
-| generateMMIOWrite (冲突检测) | QEMUCodeGen.cpp | 850-920 |
-| signalExists (功能追踪) | QEMUCodeGen.cpp | 280-300 |
-| generateActionCode | QEMUCodeGen.cpp | 450-520 |
+| generateMMIOWrite | QEMUCodeGen.cpp | 393-489 |
+| signalExists | QEMUCodeGen.cpp | 718-736 |
+| generateActionCode | QEMUCodeGen.cpp | 866-957 |
 
 ## 示例输出
 
