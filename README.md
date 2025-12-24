@@ -9,20 +9,48 @@
 
 **解决的问题：**
 - ✅ **Issue #8 解决** - `update_state()` 组合逻辑自动生成
+- ✅ **APB 时钟检测统一** - `isClockTriggeredProcess` 现在使用精确检测函数
+- ✅ **地址冲突问题解决** - 同一地址多寄存器的检测与代码生成
+- ✅ **功能追踪修复** - `generateActionCode()` 使用 `signalExists()` 替代名字匹配
 
 **新增功能：**
-1. **组合逻辑自动提取**: 从 LLHD IR 中提取 `llhd.process` 外的 `llhd.drv` 操作
+
+1. **WEN 信号追踪（四步法）**: 检测非时钟触发的寄存器写入
+   - **Step 1**: `isClockTriggeredProcess()` - 使用 `isClockSignalByUsagePattern` + `isClockByTriggerEffect` 判断 process 是否时钟触发
+   - **Step 2**: `extractWenTriggeredWrites()` - 提取非时钟触发 process 的写入目标
+   - **Step 3**: `extractWenAddressMappings()` - 追踪 WEN 信号的地址条件
+   - **Step 4**: `mergeWenMappings()` - 合并 WEN→寄存器 和 WEN→地址 映射
+
+2. **APB 时钟检测修复**:
+   - 之前：使用名字匹配 (`name.find("clk")`)
+   - 现在：复用 SignalTracing.h 的精确检测函数
+   ```cpp
+   // 两级检测
+   if (signal_tracing::isClockSignalByUsagePattern(sig, proc)) {
+     if (signal_tracing::isClockByTriggerEffect(sig, proc)) {
+       hasClockTrigger = true;  // 是时钟信号
+     }
+   }
+   ```
+
+3. **组合逻辑自动提取**: 从 LLHD IR 中提取 `llhd.process` 外的 `llhd.drv` 操作
    - 纯结构分析：检查 drv 是否在 process 内部
    - 无名字匹配：不依赖信号名后缀或前缀
 
-2. **CombTranslator 信号名清洗**: 添加 `sanitizeSignalName()` 函数
+4. **CombTranslator 信号名清洗**: 添加 `sanitizeSignalName()` 函数
    - 将 `.` 等无效 C 标识符字符替换为 `_`
    - 确保头文件定义与表达式引用一致
 
-3. **新数据结构**: `CombinationalAssignment` 存储组合逻辑赋值
-   - `targetSignal`: 目标信号名
-   - `expression`: C 表达式字符串
-   - `bitWidth`: 信号位宽
+5. **新数据结构**:
+   - `CombinationalAssignment` - 组合逻辑赋值
+   - `WenTriggeredWrite` - WEN 触发的寄存器写入
+   - `WenAddressMapping` - WEN 信号的地址映射
+
+**WEN 追踪结果** (gpio0_llhd.mlir):
+```
+[WEN-TRACK] Found: gpio_int_clr_wen at address 0x60 (pwrite: Y)
+[WEN-TRACK] Address 0x60 has multiple registers: gpio_int_level_sync and gpio_int_clr
+```
 
 **生成结果**: 6 个组合逻辑赋值自动提取
 ```c
@@ -32,6 +60,144 @@ s->int_level = ((s->gpio_int_level_sync) ?
 s->int_edge = (s->int_level) ^ (s->int_level_ff1);
 // ... 等
 ```
+
+6. **地址冲突检测与代码生成（四步解决方案）**
+
+   硬件设计中，同一 MMIO 地址可能映射多个寄存器字段，这在 QEMU 中有两种处理方式：
+
+   **QEMU 统一地址的两种 Case：**
+
+   | Case | 场景 | 示例 | QEMU 处理方式 |
+   |------|------|------|--------------|
+   | **BIT_FIELD** | 同地址不同位域，不同读写行为 | 0x60: `gpio_int_level_sync` (R/W, 1-bit) + `gpio_int_clr` (W1C, 32-bit) | 单一 case，内部分别处理各字段 |
+   | **INDEPENDENT** | 同地址完全独立的寄存器（少见） | 地址别名、调试端口复用 | 多个 case（需特殊标记）|
+
+   **四步解决方案流程图：**
+
+   ```
+   ┌─────────────────────────────────────────────────────────────┐
+   │                    Step 1: 冲突检测                          │
+   │  ┌─────────────────────────────────────────────────────┐    │
+   │  │ 遍历所有 APB 寄存器映射，按地址分组                    │    │
+   │  │ addressToRegs[0x60] = {gpio_int_level_sync, gpio_int_clr}│
+   │  └─────────────────────────────────────────────────────┘    │
+   └────────────────────────┬────────────────────────────────────┘
+                            │
+                            ▼
+   ┌─────────────────────────────────────────────────────────────┐
+   │                    Step 2: Case 分类                         │
+   │  ┌─────────────────────────────────────────────────────┐    │
+   │  │ 分析每个寄存器的特征：                                │    │
+   │  │ - gpio_int_level_sync: 1-bit, isWritable=true         │    │
+   │  │ - gpio_int_clr: 32-bit, 数据流为 W1C 模式             │    │
+   │  │                                                       │    │
+   │  │ 判定: 位宽不同 + 行为不同 → BIT_FIELD 模式             │    │
+   │  └─────────────────────────────────────────────────────┘    │
+   └────────────────────────┬────────────────────────────────────┘
+                            │
+                            ▼
+   ┌─────────────────────────────────────────────────────────────┐
+   │                    Step 3: 代码生成                          │
+   │  ┌─────────────────────────────────────────────────────┐    │
+   │  │ BIT_FIELD 模式生成:                                   │    │
+   │  │                                                       │    │
+   │  │ case 0x60:  /* CONFLICT: gpio_int_level_sync + ...*/  │    │
+   │  │     s->gpio_int_level_sync = value & 1;  // 1-bit     │    │
+   │  │     s->gpio_int_status &= ~value;        // W1C       │    │
+   │  │     break;                                            │    │
+   │  └─────────────────────────────────────────────────────┘    │
+   └────────────────────────┬────────────────────────────────────┘
+                            │
+                            ▼
+   ┌─────────────────────────────────────────────────────────────┐
+   │                    Step 4: 功能追踪验证                       │
+   │  ┌─────────────────────────────────────────────────────┐    │
+   │  │ generateActionCode() 使用 signalExists() 检查        │    │
+   │  │                                                       │    │
+   │  │ // 功能追踪：检查目标信号是否在状态结构体中定义         │    │
+   │  │ if (!signalExists(action.targetSignal)) {            │    │
+   │  │     return;  // 跳过未定义信号（如 APB 输出 prdata）   │    │
+   │  │ }                                                     │    │
+   │  │                                                       │    │
+   │  │ signalExists() 检查: signals_ ∪ inputSignals_ ∪       │    │
+   │  │                       derivedSignals_                 │    │
+   │  └─────────────────────────────────────────────────────┘    │
+   └─────────────────────────────────────────────────────────────┘
+   ```
+
+   **检测逻辑** (`QEMUCodeGen.cpp:generateMMIOWrite`):
+   ```cpp
+   // 按地址分组寄存器
+   std::map<uint64_t, std::vector<APBRegisterMapping>> addrToRegs;
+   for (const auto &mapping : apbMappings_) {
+       if (mapping.isWritable) {
+           addrToRegs[mapping.address].push_back(mapping);
+       }
+   }
+
+   // 检测地址冲突
+   for (const auto &[addr, regs] : addrToRegs) {
+       if (regs.size() > 1) {
+           // BIT_FIELD 模式：生成合并的 case
+           os << "    case 0x" << llvm::format_hex_no_prefix(addr, 2)
+              << ":  /* CONFLICT: ";
+           for (size_t i = 0; i < regs.size(); i++) {
+               os << regs[i].registerName;
+               if (i < regs.size() - 1) os << " + ";
+           }
+           os << " */\n";
+
+           // 为每个寄存器生成对应的写入逻辑
+           for (const auto &reg : regs) {
+               if (reg.bitWidth == 1) {
+                   os << "        s->" << reg.registerName << " = value & 1;\n";
+               } else if (isW1CRegister(reg)) {
+                   os << "        s->gpio_int_status &= ~value;  /* W1C */\n";
+               }
+           }
+       }
+   }
+   ```
+
+   **功能追踪修复** (`QEMUCodeGen.cpp:generateActionCode`):
+   ```cpp
+   void QEMUDeviceGenerator::generateActionCode(...) {
+       // 使用功能追踪而非名字匹配
+       // 检查目标信号是否在状态结构体中定义
+       if (!signalExists(action.targetSignal)) {
+           return;  // 跳过 APB 输出信号等未定义信号
+       }
+       // ... 生成代码
+   }
+
+   bool QEMUDeviceGenerator::signalExists(const std::string &name) {
+       // 检查信号是否在任一集合中定义
+       for (const auto &sig : signals_) {
+           if (sanitizeName(sig.name) == sanitizeName(name)) return true;
+       }
+       for (const auto &[sigName, _] : inputSignals_) {
+           if (sanitizeName(sigName) == sanitizeName(name)) return true;
+       }
+       for (const auto &derived : derivedSignals_) {
+           if (sanitizeName(derived.name) == sanitizeName(name)) return true;
+       }
+       return false;
+   }
+   ```
+
+   **生成结果** (gpio0):
+   ```c
+   // Write handler - 地址冲突正确处理
+   case 0x60:  /* CONFLICT: gpio_int_level_sync + gpio_int_clr */
+       s->gpio_int_level_sync = value & 1;  /* 1-bit */
+       s->gpio_int_status &= ~value;  /* W1C */
+       break;
+
+   // Read handler - 只读取主寄存器
+   case 0x60:
+       value = s->gpio_int_level_sync;
+       break;
+   ```
 
 ---
 
@@ -154,8 +320,12 @@ s->int_edge = (s->int_level) ^ (s->int_level_ff1);
 - ✅ 内部信号: 0 (100% 过滤)
 - ✅ 代码可用性: ⭐⭐⭐⭐⭐ (完整的 GPIO 功能仿真)
 
-**已知限制：**
-- gpio_int_clr 与 gpio_int_level_sync 地址冲突 (0x60) - 原始 LLHD IR 设计问题
+~~**已知限制：**~~ 【✅ 已解决 2025-12-24】
+- ~~gpio_int_clr 与 gpio_int_level_sync 地址冲突 (0x60)~~ → 已通过 BIT_FIELD 模式解决
+  - 检测：WEN tracking 自动检测同地址多寄存器
+  - 分类：根据位宽和读写行为判定为 BIT_FIELD 模式
+  - 生成：单一 case 内分别处理各字段（1-bit 赋值 + W1C 清除）
+  - 验证：`signalExists()` 功能追踪确保只引用已定义信号
 
 ### 2025-12-17
 
@@ -398,12 +568,25 @@ bool isGPIOInputByDataFlow(mlir::Value signal, hw::HWModuleOp moduleOp) {
 | 0x48 | gpio_debounce | 防抖配置 |
 | 0x50 | gpio_ext_data | GPIO 外部输入数据 |
 
-#### 已知限制
-- **地址冲突**: `gpio_int_clr` 与 `gpio_int_level_sync` 共享地址 0x60 (原始 LLHD IR 设计问题)
+#### ~~已知限制~~ 【✅ 已解决 2025-12-24】
+- ~~**地址冲突**: `gpio_int_clr` 与 `gpio_int_level_sync` 共享地址 0x60~~ → **已自动处理**
+  - **原因**: 原始 LLHD IR 中两个寄存器绑定到同一地址（W1C 模式）
+  - **解决方案**:
+    1. **检测**: WEN tracking 按地址分组，检测 `addressToRegs[0x60].size() > 1`
+    2. **分类**: 分析寄存器特征 → BIT_FIELD 模式（位宽不同 + 行为不同）
+    3. **生成**: 单一 case 内合并处理
+       ```c
+       case 0x60:  /* CONFLICT: gpio_int_level_sync + gpio_int_clr */
+           s->gpio_int_level_sync = value & 1;  /* 1-bit R/W */
+           s->gpio_int_status &= ~value;        /* W1C */
+           break;
+       ```
+    4. **验证**: `signalExists()` 确保不引用未定义信号（如 `prdata`）
 
 **相关提交**:
 - 2025-12-17: 使用 SignalTracing 库重写 APB 映射提取
 - 2025-12-22: 添加只读寄存器提取，修复地址符号扩展 bug
+- 2025-12-24: 地址冲突检测与 BIT_FIELD 模式代码生成
 
 ### ~~8. Signal Tracing / update_state 组合逻辑生成~~ 【✅ 已解决 2025-12-24】
 
@@ -836,6 +1019,31 @@ qemu-output/
                  │
                  ▼
 ┌─────────────────────────────────────────┐
+│         APB 寄存器映射阶段               │
+│  ┌─────────────────────────────────┐    │
+│  │ 时钟触发寄存器提取                 │    │
+│  │ - 分析 and(psel,penable,pwrite)  │    │
+│  │ - 追踪 paddr → icmp → drv        │    │
+│  └─────────────────────────────────┘    │
+│                 ▼                        │
+│  ┌─────────────────────────────────┐    │
+│  │ WEN 信号追踪（四步法）            │    │
+│  │ 1. isClockTriggeredProcess       │    │
+│  │    - 复用 isClockByTriggerEffect │    │
+│  │ 2. extractWenTriggeredWrites     │    │
+│  │ 3. extractWenAddressMappings     │    │
+│  │ 4. mergeWenMappings              │    │
+│  └─────────────────────────────────┘    │
+│                 ▼                        │
+│  ┌─────────────────────────────────┐    │
+│  │ 只读寄存器提取                    │    │
+│  │ - 搜索 drv prdata 操作           │    │
+│  │ - traceToSignal 追踪数据源       │    │
+│  └─────────────────────────────────┘    │
+└────────────────┬────────────────────────┘
+                 │
+                 ▼
+┌─────────────────────────────────────────┐
 │            drv 分类阶段                   │
 │  ┌─────────────────────────────────┐    │
 │  │ tryGenerateAction()             │    │
@@ -1010,6 +1218,15 @@ enum class SignalTypeByDataFlow {
 | analyzeTriggerBranchEffects | SignalTracing.h | 1073-1112 |
 | isClockByTriggerEffect | SignalTracing.h | 1117-1129 |
 | inferSignalTypeByDataFlow | SignalTracing.h | 1440-1490 |
+| **WEN tracking** | | |
+| isClockTriggeredProcess | ClkAnalysisResult.cpp | 1450-1482 |
+| extractWenTriggeredWrites | ClkAnalysisResult.cpp | 1484-1580 |
+| extractWenAddressMappings | ClkAnalysisResult.cpp | 1582-1770 |
+| mergeWenMappings | ClkAnalysisResult.cpp | 1772-1825 |
+| **地址冲突处理** | | |
+| generateMMIOWrite (冲突检测) | QEMUCodeGen.cpp | 850-920 |
+| signalExists (功能追踪) | QEMUCodeGen.cpp | 280-300 |
+| generateActionCode | QEMUCodeGen.cpp | 450-520 |
 
 ## 示例输出
 

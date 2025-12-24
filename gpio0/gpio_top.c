@@ -112,7 +112,6 @@ static void gpio_top_on_presetn_write(gpio_top_state *s, uint32_t value)
         s->gpio_sw_dir = s->pwdata;
     }
     if (!value) {
-        s->prdata = 0;
     }
     if (!value) {
         s->gpio_int_clk_en = 0;
@@ -165,6 +164,9 @@ static uint64_t gpio_top_read(void *opaque, hwaddr addr, unsigned size)
     uint64_t value = 0;
 
     switch (addr) {
+    case 0x60:  /* CONFLICT: gpio_int_level_sync + gpio_int_clr */
+        value = s->gpio_int_level_sync;
+        break;
     case 0x00:  /* gpio_sw_data */
         value = s->gpio_sw_data;
         break;
@@ -195,9 +197,6 @@ static uint64_t gpio_top_read(void *opaque, hwaddr addr, unsigned size)
     case 0x50:  /* gpio_ext_data */
         value = s->gpio_ext_data;
         break;
-    case 0x60:  /* gpio_int_level_sync */
-        value = s->gpio_int_level_sync;
-        break;
     default:
         qemu_log_mask(LOG_GUEST_ERROR, "gpio_top: bad read at 0x%" HWADDR_PRIx "\n", addr);
     }
@@ -210,6 +209,10 @@ static void gpio_top_write(void *opaque, hwaddr addr,
     gpio_top_state *s = opaque;
 
     switch (addr) {
+    case 0x60:  /* CONFLICT: gpio_int_level_sync + gpio_int_clr */
+        s->gpio_int_level_sync = value & 1;  /* 1-bit */
+        s->gpio_int_status &= ~value;  /* W1C */
+        break;
     case 0x00:  /* gpio_sw_data */
         s->gpio_sw_data = value;
         break;
@@ -227,10 +230,6 @@ static void gpio_top_write(void *opaque, hwaddr addr,
         break;
     case 0x3c:  /* gpio_int_pol */
         s->gpio_int_pol = value;
-        break;
-    case 0x60:  /* gpio_int_level_sync */
-        s->gpio_int_level_sync = value;
-        gpio_top_on_gpio_int_level_sync_write(s, value);
         break;
     default:
         qemu_log_mask(LOG_GUEST_ERROR, "gpio_top: bad write at 0x%" HWADDR_PRIx "\n", addr);
@@ -274,7 +273,6 @@ static void gpio_top_reset(DeviceState *dev)
     s->zero_value = 0;
     s->gpio_int_clk_en = 0;
     s->gpio_int_type = 0;
-    s->gpio_int_clr = 0;
     s->SUPPORT_INT_LEVEL_SYNC_PROC_int_level_sync_in_ff2 = 0;
     s->gpio_int_clr_wen = 0;
     s->ri_gpio_int_en = 0;

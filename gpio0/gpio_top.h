@@ -29,7 +29,6 @@ typedef struct gpio_top_state {
     uint8_t zero_value;
     uint8_t gpio_int_clk_en;
     uint32_t gpio_int_type;
-    uint32_t gpio_int_clr;
     uint32_t SUPPORT_INT_LEVEL_SYNC_PROC_int_level_sync_in_ff2;
     uint8_t gpio_int_clr_wen;
     uint32_t ri_gpio_int_en;
